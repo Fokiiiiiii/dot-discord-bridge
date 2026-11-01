@@ -51,3 +51,11 @@ Gateway sequence advances only after synchronous SQLite metadata commit. Offline
 - OAuth targeted tests14/14 and full offline suite97/97 PASS; all-target Clippy with warnings denied PASS.
 - Added static-only first-failure categories for consent JSON403. Tests cover all seven categories, missing Origin/cookie, DB read/write failure and rollback, exact unchanged generic response/no-store behavior. Existing success, wrong-secret303 denial, CSRF, PKCE and revocation tests remain passing.
 - No credential/header/request values or raw errors enter the diagnostic emitter. No deployment, credential inspection or security setting change performed. Actual live403 cause remains unconfirmed until approved deployment reports a category.
+
+## Consent GET referrer policy fix (2026-11-01)
+
+- Targeted OAuth tests16/16; full offline suite99/99; Clippy all-targets warnings denied PASS.
+- Only consent GET HTML gets strict-origin. Regression asserts metadata/resource/error/303 responses retain no-referrer; missing/null/hostile Origin still rejects without issuing a code. Existing exact Host/cookie/secret and diagnostic tests continue passing.
+- Fetch/Referrer Policy standards verified: native non-CORS POST under no-referrer serializes Origin as null; strict-origin sends at most origin, never the authorization URL path/query.
+- Native browser fixture attempted with synthetic non-secret form only, but cloud browser could not connect to executor loopback (ERR_CONNECTION_REFUSED). Fixture was stopped; no external exposure or workaround used. Therefore native-browser behavior and no-query-leak observation remain NOT empirically verified in this task; server header regression and normative standard support the change.
+- No deployment, credential access or security-setting modification.

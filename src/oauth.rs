@@ -483,6 +483,11 @@ async fn authorize(
     }
     let html=format!("<!doctype html><html><meta charset=utf-8><title>Authorize Discord DM bridge</title><h1>Authorize Discord DM bridge</h1><p>This client can receive your Discord DMs and reply as your bot. Approve only the ChatGPT connection you just initiated.</p><p>Client: {}<br>Redirect: {}</p><form method=post action=/oauth/authorize><input type=hidden name=request value=\"{}\"><label>Owner approval secret <input type=password name=approval_secret autocomplete=off required></label><button type=submit>Approve access</button></form><p>Close this page to deny.</p></html>",escape(&s.config.client),escape(&a.redirect_uri),request);
     let mut r = secure(Html(html).into_response());
+    // Native non-CORS form POSTs under no-referrer can serialize Origin as null
+    // (Fetch: append a request Origin header). Preserve origin without exposing
+    // the authorization path/query. Other OAuth responses keep no-referrer.
+    r.headers_mut()
+        .insert(header::REFERRER_POLICY, "strict-origin".parse().unwrap());
     consent_csp(&s, &mut r);
     r.headers_mut().insert(
         header::SET_COOKIE,
@@ -821,6 +826,49 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(&bytes[..], br#"{"error":"access_denied"}"#);
+        }
+    }
+    #[tokio::test]
+    async fn consent_html_uses_origin_only_referrer_policy_and_other_responses_do_not() {
+        let s = Arc::new(server());
+        let page = authorize(State(s.clone()), headers(), Query(auth(&s))).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(page.headers()[header::REFERRER_POLICY], "strict-origin");
+        assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
+        for response in [
+            metadata(State(s.clone()), headers()).await,
+            resource_metadata(State(s.clone()), headers()).await,
+            error(StatusCode::FORBIDDEN, "access_denied"),
+        ] {
+            assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        }
+        let (server, h, f) = pending_consent();
+        let response = consent(State(Arc::new(server)), h, Form(f)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+    }
+    #[test]
+    fn consent_still_rejects_null_missing_and_hostile_origin() {
+        for origin in [
+            None,
+            Some("null"),
+            Some("https://attacker.example"),
+            Some("https://discord.example.com.attacker.example"),
+        ] {
+            let (s, mut h, f) = pending_consent();
+            h.remove(header::ORIGIN);
+            if let Some(origin) = origin {
+                h.insert(header::ORIGIN, origin.parse().unwrap());
+            }
+            assert_eq!(consent_location(&s, &h, &f), Err(ConsentFailure::Origin));
+            assert_eq!(
+                s.db.lock()
+                    .unwrap()
+                    .query_row("SELECT count(*) FROM oauth_codes", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
         }
     }
     #[test]

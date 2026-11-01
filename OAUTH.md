@@ -8,7 +8,7 @@ This implements a single preconfigured confidential OAuth client for this bridge
 
 In ChatGPT **Plugins → + → Add custom MCP server**, use `https://discord-mcp.foki.sh/mcp`, choose OAuth with a predefined client, and enter the client ID and client secret in its secure setup fields. Prefer `client_secret_basic`; `client_secret_post` is also supported. The issuer advertises RFC 9207 and includes `iss` in successful authorization redirects. ChatGPT may consequently show `https://chatgpt.com/connector_platform_oauth_redirect`; **copy what the management page actually shows**, do not infer or wildcard it. Redirect configuration is distinct from `CALLBACK_ALLOWED_HOSTS` for MCP Events.
 
-The owner approval secret belongs **only in the password field on the bridge's HTTPS consent page**, after verifying the hostname and initiating the intended connection. It is not the OAuth client secret and is not entered in ChatGPT's client-secret field. Closing the consent page denies approval. The form has a one-use cookie-bound nonce, same-origin POST check, five-minute lifetime, no external assets, no referrer, no-store responses, and frame blocking. Concurrent authorization tabs overwrite the single browser cookie; restart the intended flow if that happens.
+The owner approval secret belongs **only in the password field on the bridge's HTTPS consent page**, after verifying the hostname and initiating the intended connection. It is not the OAuth client secret and is not entered in ChatGPT's client-secret field. Closing the consent page denies approval. The form has a one-use cookie-bound nonce, same-origin POST check, five-minute lifetime, no external assets, origin-only referrer policy on the consent HTML, no-store responses, and frame blocking. Concurrent authorization tabs overwrite the single browser cookie; restart the intended flow if that happens.
 
 Do not embed any secret in `mcp.json`, URLs, CLI arguments, chat, screenshots, or logs. A manifest declaration alone does not save credentials or complete consent. The included template describes the predefined OAuth client; replace its placeholders only after verifying the actual connection.
 
@@ -63,3 +63,10 @@ A local JSON403 from `/oauth/authorize` POST emits exactly one static stderr lin
 - `validation`: generic internal validation/state failure, including exhausted failed-approval bookkeeping. It does not disclose authorization details.
 
 An ordinary wrong owner approval secret still follows the existing bound303 OAuth denial redirect; these diagnostics do not change that behavior. A fresh successful GET alone does not prove that the same browser sends its cookie/Origin on POST. Diagnose a real incident only after the approved updated deployment reports a category; do not assume a cause from403 alone.
+
+
+## Native form Origin compatibility
+
+Only successful consent GET HTML overrides `Referrer-Policy` to `strict-origin`; all other OAuth responses, including303 redirects, retain `no-referrer`. The Fetch standard explicitly sets Origin to null for non-CORS non-GET/HEAD requests under no-referrer, which conflicts with the intentionally strict same-origin POST check. strict-origin preserves the origin for HTTPS-to-HTTPS native form POSTs while omitting path/query from Referer; it does not permit full authorization URLs to be sent as referrers. Null, missing and hostile Origin remain rejected. Existing Host/cookie/pending/owner-secret checks and privacy-safe diagnostics are unchanged.
+
+Standards: https://fetch.spec.whatwg.org/#append-a-request-origin-header and https://www.w3.org/TR/referrer-policy/#referrer-policy-strict-origin . This explains a plausible403 mechanism; the deployed incident still needs an approved live retry/category check.
