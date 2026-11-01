@@ -4,7 +4,7 @@
     "discord-dot-bridge": {
       "type": "streamable-http",
       "url": "https://REPLACE-WITH-VERIFIED-HOST.example/mcp",
-      "extensions": {"com.openai": {"auth": {"type": "api_key", "headerScheme": "bearer"}}}
+      "extensions": {"com.openai": {"auth": {"type": "oauth", "client": {"mode": "provided", "clientId": "discord-dot-owner", "tokenEndpointAuthMethod": "client_secret_basic"}, "baseScopes": ["discord:dm"]}}}
     }
   }
 }

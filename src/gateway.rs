@@ -4,14 +4,19 @@
 use anyhow::{anyhow, bail, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::{
-    sync::mpsc,
-    time::{self, Instant, MissedTickBehavior},
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::time::{self, Instant, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-const INTENTS: u64 = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
+// DM-only: DIRECT_MESSAGES supplies MESSAGE_CREATE. Content in DMs with the
+// app is exempt from the privileged MESSAGE_CONTENT intent; do not request guild
+// events or privileged content access. Owner/channel authorization remains the
+// persistence layer's responsibility; Gateway intents alone are not an ACL.
+// https://docs.discord.com/developers/events/gateway#message-content-intent
+const INTENTS: u64 = 1 << 12;
 
 #[derive(Default)]
 struct State {
@@ -93,6 +98,21 @@ fn auth_packet(token: &str, state: &State) -> Value {
     }
 }
 
+pub type Persist = dyn Fn(&Value) -> Result<()> + Send + Sync;
+
+// The callback must be short and synchronous: durable SQLite metadata only,
+// never network I/O. Commit the resume sequence only after persistence succeeds.
+fn persist_and_advance(packet: &Value, state: &mut State, persist: &Persist) -> Result<()> {
+    if packet["t"] == "MESSAGE_CREATE" && persist(&packet["d"]).is_err() {
+        eprintln!("Durable DM inbox persistence failed; resume sequence remains unchanged");
+        bail!("Durable DM inbox persistence failed");
+    }
+    if let Some(sequence) = packet["s"].as_u64() {
+        state.sequence = Some(sequence);
+    }
+    Ok(())
+}
+
 enum Outcome {
     Retry(Duration),
     Fatal(&'static str),
@@ -102,7 +122,7 @@ async fn connection(
     token: &str,
     url: &str,
     state: &mut State,
-    tx: &mpsc::Sender<Value>,
+    persist: &Persist,
 ) -> Result<Outcome> {
     let (mut ws, _) = time::timeout(Duration::from_secs(30), connect_async(url)).await??;
     let hello = time::timeout(Duration::from_secs(20), ws.next())
@@ -160,31 +180,13 @@ async fn connection(
                                 return Ok(Outcome::Retry(Duration::from_millis(1_000 + jitter_ms(4_000))));
                             }
                             Some(0) => {
-                                match packet["t"].as_str() {
-                                    Some("READY") => {
+                                if let Some("READY") = packet["t"].as_str() {
                                         state.session = Some(packet["d"]["session_id"].as_str()
                                             .ok_or_else(|| anyhow!("Missing Gateway session ID"))?.to_owned());
                                         state.resume_url = Some(gateway_url(packet["d"]["resume_gateway_url"].as_str()
                                             .ok_or_else(|| anyhow!("Missing resume Gateway URL"))?)?);
-                                    }
-                                    Some("MESSAGE_CREATE") => {
-                                        // Never block the heartbeat/ACK reader waiting for a full queue.
-                                        // Do not advance sequence until the message has been accepted.
-                                        match tx.try_send(packet["d"].clone()) {
-                                            Ok(()) => (),
-                                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                return Ok(Outcome::Fatal("Message persistence receiver stopped"));
-                                            }
-                                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                                return Ok(Outcome::Retry(Duration::from_secs(2)));
-                                            }
-                                        }
-                                    }
-                                    _ => (),
                                 }
-                                if let Some(sequence) = packet["s"].as_u64() {
-                                    state.sequence = Some(sequence);
-                                }
+                                persist_and_advance(&packet, state, persist)?;
                             }
                             _ => (),
                         }
@@ -196,9 +198,10 @@ async fn connection(
     }
 }
 
-/// Forward MESSAGE_CREATE packets to the persistence worker until cancelled.
+/// Persist MESSAGE_CREATE metadata synchronously before acknowledging sequence.
+/// The callback must perform only a short local durable write, with no network I/O.
 /// Fatal errors are intentionally generic and never include credentials or URLs.
-pub async fn run(token: String, tx: mpsc::Sender<Value>) -> Result<()> {
+pub async fn run(token: String, persist: Arc<Persist>) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -209,9 +212,6 @@ pub async fn run(token: String, tx: mpsc::Sender<Value>) -> Result<()> {
     let mut next_identify = Instant::now();
     let mut backoff = 1_u64;
     loop {
-        if tx.is_closed() {
-            bail!("Message persistence receiver stopped");
-        }
         if state.session.is_none() || state.sequence.is_none() {
             time::sleep_until(next_identify).await;
             // Fetch fresh session-start quota before EVERY Identify, not just startup.
@@ -292,7 +292,7 @@ pub async fn run(token: String, tx: mpsc::Sender<Value>) -> Result<()> {
             .ok_or_else(|| anyhow!("Missing Gateway endpoint"))?
             .clone();
         let connected_at = Instant::now();
-        let outcome = connection(&token, &url, &mut state, &tx).await;
+        let outcome = connection(&token, &url, &mut state, persist.as_ref()).await;
         // Measure from the completed attempt as well, so a slow handshake cannot
         // compress the spacing between actual Identify packets.
         next_identify = Instant::now() + Duration::from_millis(5_100);
@@ -368,6 +368,38 @@ mod tests {
         ] {
             assert!(gateway_url(invalid).is_err());
         }
+    }
+    #[test]
+    fn persistence_failure_preserves_resume_sequence() {
+        let mut state = State {
+            sequence: Some(41),
+            ..State::default()
+        };
+        let packet = json!({"t":"MESSAGE_CREATE", "s":42, "d":{"id":"message"}});
+        let failed = |_: &Value| -> Result<()> { bail!("database unavailable") };
+        assert!(persist_and_advance(&packet, &mut state, &failed).is_err());
+        assert_eq!(state.sequence, Some(41));
+        let success = |data: &Value| -> Result<()> {
+            assert_eq!(data["id"], "message");
+            Ok(())
+        };
+        persist_and_advance(&packet, &mut state, &success).unwrap();
+        assert_eq!(state.sequence, Some(42));
+    }
+    #[test]
+    fn non_message_dispatch_advances_without_persistence() {
+        let mut state = State::default();
+        let packet = json!({"t":"RESUMED", "s":42, "d":{}});
+        let unexpected = |_: &Value| -> Result<()> { panic!("not a message") };
+        persist_and_advance(&packet, &mut state, &unexpected).unwrap();
+        assert_eq!(state.sequence, Some(42));
+    }
+    #[test]
+    fn identify_requests_only_direct_messages() {
+        let packet = auth_packet("placeholder", &State::default());
+        let intents = packet["d"]["intents"].as_u64().unwrap();
+        assert_eq!(intents, 1 << 12);
+        assert_eq!(intents & ((1 << 0) | (1 << 9) | (1 << 15)), 0);
     }
     #[test]
     fn identifies_then_resumes() {

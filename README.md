@@ -1,50 +1,65 @@
-# Discord → existing dot bridge (private prototype)
+# Discord DM → existing dot bridge (Rust, private prototype)
 
-Discord Gateway → persistent local queue → signed MCP Events callback → **your existing dot** → `discord_reply` → Discord.
+**Owner-only, one-to-one Bot DMs. No server-channel monitoring.**
 
-No Codex runtime, OpenAI API key, or separate AI bot is needed by this application. This implementation is Rust (edition 2021); dependencies are declared in Cargo.toml. This is a single-owner, single-process implementation, not a multi-tenant service.
+Owner sends a DM to the Discord bot → Gateway `DIRECT_MESSAGES` → durable identifiers-only inbox → verify DM recipient and retrieve message using official Discord REST → SQLite outbox → signed MCP Events → existing dot → `discord_reply` to the same DM and source message.
 
-## What was actually verified
+No separate model, OpenAI API key, or Codex runtime is used. Rust 1.99+, a C compiler for bundled SQLite, one always-on process, persistent private disk, and public HTTPS are required. GitHub is optional for deployment.
 
-Rust unit-test sources cover filtering/deduplication, authorization, discovery, uncertain replies, revoked-user delivery, callback validation, public-IP policy, signatures, and Gateway helpers. All 25 Rust tests and clippy with warnings denied passed; release build succeeded. See VALIDATION.md. No real Discord or ChatGPT connection, public deployment, or plugin installation has been performed. `plugin-template/` is a **template, not an installed/connected plugin**.
+## Security boundary
 
-## Setup (requires owner approval before external changes)
+- Set exactly one `DISCORD_OWNER_USER_ID`. Other authors, bot/webhook authors, guild messages, group DMs and unverified channels are rejected.
+- The bridge obtains `GET /api/v10/channels/{id}` using the Bot token and requires channel type `1`, no guild, and exactly one recipient matching the owner. Successful checks cache for five minutes, never across restart; queued deliveries and replies recheck when needed.
+- Gateway intent is only `DIRECT_MESSAGES (1 << 12)`. Bot DMs are exempt from the privileged Message Content requirement. No server message/privileged content intent is requested.
+- `discord.dm.created` subscriptions require the configured `owner_user_id`; a channel ID is not required or manually configured. The DM is learned from the owner's incoming message.
+- Replies are only to observed owner messages in that same verified DM. One source message gets one logical reply, split into Discord-sized parts if needed; bridge-owned replies can be edited via their source ID. There is no send-to-arbitrary-recipient tool, unsolicited DM creation, or Discord thread creation. Discord DMs are already the conversation; reply references preserve context.
+- Subscription automation must be created in the existing dot with a bounded response policy. Running this bridge alone does not generate replies.
 
-1. Choose an always-on host with persistent disk and public HTTPS ingress, plus outbound HTTPS/WebSocket access to Discord and the actual ChatGPT callback hostname. Sites-only hosting is not assumed to support this persistent Gateway process. Run one instance only.
-2. In Discord Developer Portal create/use a **bot**, not a user token/self-bot. Enable Message Content Intent. Grant only View Channel, Read Message History, Send Messages in one selected channel; no Administrator. Add it to the server with explicit approval. Threads need separate access and their own allowlisted channel ID.
-3. Copy `.env.example` to `.env` **on that host**, set permissions `chmod 600 .env`, fill the bot token, a new random MCP bearer secret, exact channel and authorized Discord user IDs. Do not paste actual tokens into chat or include them in plugin archives. Do not use `source .env` on a file supplied by someone else: it executes shell code. Configure these values through the host's secret/environment settings.
-4. `CALLBACK_ALLOWED_HOSTS` must contain the exact hostname from the real platform subscription. Establish that host from trusted connection diagnostics; do not guess or broadly allow arbitrary domains. Keep the callback pending until approved; the bridge fails closed without it. `MCP_ALLOWED_HOSTS` is the exact inbound HTTP Host header (normally your public hostname). The reverse proxy must preserve this header.
-5. Install the official stable Rust toolchain using rustup after approval. Run `cargo test --locked` and `cargo build --release --locked`. Start with `umask 077; ./target/release/discord-dot-bridge` and the configured environment. Cargo.lock captures the resolved dependency versions.
-6. The application binds only `127.0.0.1:8787`. Put an HTTPS reverse proxy in front, expose only `/mcp`, preserve Authorization and Host, enforce request limits/rate limits, and disable logging credentials and request bodies. Do not expose the internal port publicly. Persist the database on private encrypted disk and back it up securely: it includes webhook signing secrets and Discord text.
-7. Replace the URL in `plugin-template/mcp.json` with the verified HTTPS `/mcp` endpoint. Connect as a **private** plugin with API-key/Bearer authentication through the platform UI; put `MCP_BEARER_TOKEN` only in its secure credential field, never in package files. Upload/installation is a separate, explicitly authorized step. Rescan and confirm `discord_reply` and `discord.message.created` are visible.
-8. In the existing dot, ask it to subscribe to the exact channel and describe a narrow response policy. Example: “Monitor this channel for my Discord user only and answer ordinary messages there. Never disclose private chat history, files, or secrets; ask me before other actions.” The host creates the callback subscription. Successful HTTP callback delivery alone does not prove the dot replied.
-9. Send a harmless live test message. Verify: subscription accepted → callback 2xx → existing dot sees event → one visible Discord reply. Test non-allowed authors/channels, a bot message, duplicate input, unsubscribe, and restart. Keep live testing restricted to the approved channel.
+## Setup
 
-## Security and operational behavior
+1. Choose an approved always-on host with persistent disk and outbound Discord WSS/HTTPS plus HTTPS callback access. Request-only serverless hosting is not assumed compatible.
+2. Create/use a Discord **bot**, not a user token/self-bot. The owner must be able to open a DM with it. If Discord requires shared-server presence for discoverability/access, arrange that separately; this bridge still never reads server channels. No Administrator or server-channel read permission is required by this DM design. Bot privacy/DM rules can still prevent delivery.
+3. Put `.env.example` values into the host's secure environment configuration. The application does not auto-load `.env`; do not source an untrusted file as shell code. Never paste live secrets into chat or include them in archives.
+4. Use a new private `discord-dm.sqlite3` database. This version rejects legacy channel-mode databases and rejects changing the owner of an existing DM database. Keep backups private/encrypted. Start with `umask 077` to protect SQLite files and sidecars.
+5. `cargo test --locked`, `cargo build --release --locked`, then run `./target/release/discord-dot-bridge`. It listens only on `127.0.0.1:8787`.
+6. Put an HTTPS reverse proxy in front of `/mcp` and the exact OAuth/discovery routes listed in [OAuth setup](OAUTH.md); preserve Host/Authorization, configure request/rate limits, disable credential/body logging. Set `MCP_ALLOWED_HOSTS` to the exact public Host value.
+7. Replace the placeholder endpoint in `plugin-template/mcp.json`, configure the predefined OAuth client in the private ChatGPT connection UI, follow [OAuth setup](OAUTH.md), and rescan. Verify `discord_reply` and `discord.dm.created` appear.
+8. Ask this existing dot to monitor DMs from the configured owner and define what it may answer. Confirm the actual callback hostname via trusted connection diagnostics, allow only that hostname in `CALLBACK_ALLOWED_HOSTS`, restart/retry subscription if needed. Do not guess callback hosts or broadly allow arbitrary domains.
+9. Send a harmless owner DM. Verify Gateway receipt → callback acknowledgment → existing dot execution → a single reply in the same DM. Test another author, group/guild message rejection, duplicates, unsubscribe, and restart.
 
-- Fail-closed channel **and user** allowlists on input and delivery; bot/webhook messages discarded.
-- Authenticated Streamable HTTP endpoint, no CORS/browser Origin, explicit Host allowlist, 64 KiB request limit. This is intentionally server-to-server.
-- Callback HTTPS + exact hostname allowlist + connection-time public-IP validation, no redirects/proxies, bounded timeout/body size. Standard Webhooks HMAC-SHA256, challenge verification, deterministic subscription IDs, 5-minute key-rotation overlap and verification cache. Subscription lifetime is capped at 24 hours and rounded up to a minimum one-second granularity.
-- SQLite persists subscriptions, queue, source messages, and reply records. Owner is the single configured principal. Separate deployment and DB required for a different owner. Changes to allowlists require restart. Remove subscriptions by stopping monitoring; deleting/rotating the MCP credential alone does not remove active subscriptions, so stop the service and clear subscriptions as part of emergency revocation.
-- Event retry is bounded (up to eight attempts), at-least-once; event IDs remain stable. Permanent failures are dropped. 410 removes the subscription; 413 is not retried. For production add metrics/dead-letter inspection and alerts; do not put message bodies or secrets in logs.
-- One reply per observed source message. Persisted success prevents duplicates. An uncertain send is blocked rather than automatically retried; an operator must inspect Discord before recovery. Discord nonce is supplementary short-term protection only.
-- Source messages are kept seven days. Reply content hashes and minimal idempotency results are retained indefinitely; reply text itself is not stored. Establish a tombstone retention policy before sustained use. No attachment download, history fetch, edits, slash commands, or guild administration.
-- No protocol replay/cursor. In-memory Discord resume can bridge a reconnect, but a process restart, expired session, or queue failure can miss messages. Do not claim guaranteed delivery. No sharding or high-volume scaling.
-- MCP Events draft/platform support may evolve. Current implementation uses documented Streamable HTTP `initialize` with protocol `2025-03-26`; it does not claim MCP 2.0 support. Live interoperability remains to be verified.
+## Transport and delivery behavior
 
-## Files and test command
+Streamable HTTP `initialize` protocol `2025-03-26`, OAuth access-token authentication by default (explicit legacy bearer mode for diagnostics), exact inbound Host allowlist, no browser Origin on `/mcp`, 256 KiB MCP body limit. Not MCP 2.0. Events use webhook only; no polling/streaming/replay.
 
-`src/main.rs`: MCP + event delivery + reply tool. `src/gateway.rs`: Discord receiver. `src/webhook.rs`: secure callback delivery. Unit tests live inside each module. `.env.example`: placeholders. `plugin-template/`: private plugin packaging template.
+Callback destinations use exact HTTPS hostname allowlists, connection-time public-IP validation/pinning, normal hostname TLS verification, no redirects/proxies, bounded requests. Standard Webhooks HMAC-SHA256, signed verification, deterministic subscription identities, five-minute verification cache and key-rotation overlap. Lifetime is capped at 24 hours and rounded up to one-second granularity.
 
-```sh
-cargo test --locked
-```
+SQLite persists subscriptions, metadata-only inbox, verified messages, outbox and idempotency results. Owner ID is pinned to the database. Source and confirmed outgoing text retention is seven days; reply hashes, outgoing IDs, write journals and minimal result tombstones persist. Callback retries are bounded (eight attempts), stable IDs and possible duplicate attempts; delivery is not guaranteed and permanent/exhausted outbox failures are dropped. 410 deletes its subscription; 413 never retries. Event response bodies cannot override HTTP status. Production monitoring/dead-letter tooling is not included.
 
-## Official references (checked 2026-11-01)
+A source message with an uncertain write result is blocked from blind retry. Discord nonce provides only supplementary short-term deduplication. Gateway discovery and read lookups honor 429 delays. The bridge applies a conservative shared in-process REST cooldown after observed read/write 429 responses; this is not a full distributed bucket scheduler. Write errors, including 429, conservatively stop rather than blindly resending. Full route/global rate-limit scheduling is not included.
 
+## Important limitations
+
+- Incoming owner message/channel IDs are committed before advancing the Gateway sequence. No message text is stored until the DM recipient is verified. Network/429/5xx lookup failures are retried with bounded backoff (up to eight attempts); permanent denial/missing/wrong-recipient records become `rejected`, and exhausted retries remain `failed`, never silently deleted. `discord_bridge_status` exposes content-free counts. Pending/failed records survive restarts; completed/rejected metadata is retained seven days. Failed rows require operator inspection/recovery, not blind duplicate sends.
+- Active subscriptions are selected when the verified message is hydrated, not when its ID was staged. If a subscription expired or was stopped during retries, no delivery is queued for it. A newly active matching subscription can receive a still-pending earlier message.
+- After recipient verification the message body is retrieved from Discord. It reflects the message at lookup time, not necessarily the original pre-edit event text; the occurrence timestamp remains Discord’s original message timestamp. A deleted/inaccessible message cannot be recovered; its rejection is retained. Minimal owner-origin message/channel IDs can temporarily be stored for a group DM before it is identified/rejected, but its content is never stored or forwarded.
+- A SQLite staging failure prevents sequence advancement and triggers a reconnect/resume; a processing DB failure stops the worker/process rather than being treated as an authorization error. Disk exhaustion still requires repair. A process crash before an event is durably staged, or loss of the resumable Gateway session, can still lose an event.
+- Gateway resume state is in-memory. Process restarts/expired sessions can miss messages; no historical replay. This is not a guaranteed-delivery messaging service.
+- Existing queued events whose channel verification temporarily fails use the bounded event retry policy. No data goes to the callback before verification succeeds.
+- No attachment retrieval, voice, slash commands, edits, history backfill, group DMs, server channels, sharding, or unsolicited outbound DMs.
+- Rotating/removing MCP credentials does not cancel existing subscriptions. Emergency revocation: stop the process and remove subscriptions before restarting with changed credentials.
+- Private plugin registration, real callback verification, real Discord DMs, and this dot's live reply remain unverified until approved hosting and credentials are provided.
+
+## Validation and files
+
+See VALIDATION.md for executed tests. `src/main.rs`: MCP/persistence/DM authorization/replies; `src/gateway.rs`: DM receiver; `src/webhook.rs`: signed secure callbacks. `plugin-template/` is not an installed plugin. `.env.example` contains placeholders only.
+
+Official references:
+- https://docs.discord.com/developers/events/gateway#message-content-intent
+- https://docs.discord.com/developers/resources/channel#get-channel
+- https://docs.discord.com/developers/resources/message#create-message
+- https://docs.discord.com/developers/topics/rate-limits
 - https://developers.openai.com/plugins/build/mcp-events
-- https://docs.discord.com/developers/events/gateway
-- https://docs.discord.com/developers/resources/message
-- https://docs.discord.com/developers/topics/opcodes-and-status-codes
 
-- Draft protocol reference: https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md
+## Discord client features (v0.4.0)
+
+See [feature behavior and limits](FEATURES.md): bounded typing, multipart replies, source-bound edits, reply references, and configurable recent owner-DM context. All existing OAuth/recipient/SSRF/callback controls remain in place.

@@ -1,0 +1,33 @@
+services:
+  discord-dm:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: discord-dot-bridge:0.4.0
+    platform: linux/arm64
+    # Linux host mode preserves the service's loopback-only binding. No published ports.
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/discord-dm.sqlite3
+      PORT: "8787"
+    volumes:
+      - dm-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+volumes:
+  dm-data:
