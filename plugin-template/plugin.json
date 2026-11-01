@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "discord-dot-bridge",
+  "version": "0.1.0",
+  "description": "Receive allowed Discord messages through MCP Events and reply from the existing dot."
+}
