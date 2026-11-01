@@ -45,3 +45,9 @@ Gateway sequence advances only after synchronous SQLite metadata commit. Offline
 - HTTP regression verifies32,000 Japanese characters fit bounded256KiB MCP requests and excess still413. Additive payload schema keeps old queued four-field events valid.
 - Independent read-only review found and resolved HTTP byte-limit/long-Unicode incompatibility and old-queue schema compatibility. Restart journal regression also caught a missing intent insert before it was fixed. Final candidate has no unresolved blocking review finding under documented assumptions.
 - No live Discord requests, credential access, production changes, deployment or GitHub push. Actual typing UI, multipart Markdown rendering, live edits, ARM64 rebuild, and real dot behavior remain deployment-time verification.
+
+## Consent denial diagnostics (2026-11-01)
+
+- OAuth targeted tests14/14 and full offline suite97/97 PASS; all-target Clippy with warnings denied PASS.
+- Added static-only first-failure categories for consent JSON403. Tests cover all seven categories, missing Origin/cookie, DB read/write failure and rollback, exact unchanged generic response/no-store behavior. Existing success, wrong-secret303 denial, CSRF, PKCE and revocation tests remain passing.
+- No credential/header/request values or raw errors enter the diagnostic emitter. No deployment, credential inspection or security setting change performed. Actual live403 cause remains unconfirmed until approved deployment reports a category.

@@ -50,3 +50,16 @@ The consent endpoint caps retained failed-attempt bookkeeping at ten/hour, but a
 Local tests do not prove the current ChatGPT UI or real callback/token behavior until the live flow succeeds. No additional model/API key or Codex runtime is introduced.
 
 Official references: [OpenAI authentication](https://developers.openai.com/plugins/build/auth), [private connection flow](https://developers.openai.com/plugins/deploy/connect-chatgpt), [manifest authentication](https://developers.openai.com/plugins/build/plugins).
+
+## Privacy-safe consent denial diagnostics
+
+A local JSON403 from `/oauth/authorize` POST emits exactly one static stderr line, `oauth_consent_denied category=<category>`. Categories are limited to `host`, `origin`, `pending_missing`, `pending_expired`, `cookie_mismatch`, `db_error`, and `validation`. Only the first failing check is reported. No header values, request IDs, URLs, state, cookie values, credentials, authorization parameters or raw exception text are logged. The HTTP response remains generic `{"error":"access_denied"}` with no diagnostic header.
+
+- `host` / `origin`: inbound Host or same-origin consent requirement failed. Inspect the approved proxy/browser flow without disabling these checks or logging the values.
+- `pending_missing`: no matching pending consent remains; it may be consumed, cleaned up or absent from this database. This alone does not identify why.
+- `pending_expired`: a matching pending record is past its five-minute lifetime.
+- `cookie_mismatch`: the consent browser cookie is missing or does not match the pending request. Multiple authorization tabs overwrite the single cookie.
+- `db_error`: a database operation or database lock failed. Only the category is logged, not database details.
+- `validation`: generic internal validation/state failure, including exhausted failed-approval bookkeeping. It does not disclose authorization details.
+
+An ordinary wrong owner approval secret still follows the existing bound303 OAuth denial redirect; these diagnostics do not change that behavior. A fresh successful GET alone does not prove that the same browser sends its cookie/Origin on POST. Diagnose a real incident only after the approved updated deployment reports a category; do not assume a cause from403 alone.

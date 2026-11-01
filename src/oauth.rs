@@ -494,11 +494,44 @@ async fn authorize(
     );
     r
 }
-async fn consent(State(s): State<Arc<OAuth>>, h: HeaderMap, Form(f): Form<Consent>) -> Response {
-    if !s.good_host(&h)
-        || h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(s.config.issuer.as_str())
-    {
-        return error(StatusCode::FORBIDDEN, "access_denied");
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsentFailure {
+    Host,
+    Origin,
+    PendingMissing,
+    PendingExpired,
+    CookieMismatch,
+    Database,
+    Validation,
+}
+impl ConsentFailure {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Host => "oauth_consent_denied category=host",
+            Self::Origin => "oauth_consent_denied category=origin",
+            Self::PendingMissing => "oauth_consent_denied category=pending_missing",
+            Self::PendingExpired => "oauth_consent_denied category=pending_expired",
+            Self::CookieMismatch => "oauth_consent_denied category=cookie_mismatch",
+            Self::Database => "oauth_consent_denied category=db_error",
+            Self::Validation => "oauth_consent_denied category=validation",
+        }
+    }
+}
+impl From<rusqlite::Error> for ConsentFailure {
+    fn from(_: rusqlite::Error) -> Self {
+        Self::Database
+    }
+}
+fn consent_location(
+    s: &OAuth,
+    h: &HeaderMap,
+    f: &Consent,
+) -> std::result::Result<String, ConsentFailure> {
+    if !s.good_host(h) {
+        return Err(ConsentFailure::Host);
+    }
+    if h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(s.config.issuer.as_str()) {
+        return Err(ConsentFailure::Origin);
     }
     let cookie = h
         .get(header::COOKIE)
@@ -508,62 +541,67 @@ async fn consent(State(s): State<Arc<OAuth>>, h: HeaderMap, Form(f): Form<Consen
                 .find_map(|x| x.trim().strip_prefix("__Host-discord-oauth="))
         })
         .unwrap_or("");
-    let result = (|| -> Result<String> {
-        let mut db = s.db.lock().map_err(|_| anyhow::anyhow!("lock"))?;
-        let tx = db.transaction()?;
-        let row: Option<(String, String, i64)> = tx
-            .query_row(
-                "SELECT cookie,request,expires FROM oauth_pending WHERE id=?1",
-                [hash(&f.request)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let (expected, request, expires) = row.context("missing")?;
-        if expires <= now() || !equal(&expected, &hash(cookie)) {
-            bail!("denied");
+
+    let mut db = s.db.lock().map_err(|_| ConsentFailure::Database)?;
+    let tx = db.transaction()?;
+    let row: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT cookie,request,expires FROM oauth_pending WHERE id=?1",
+            [hash(&f.request)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (expected, request, expires) = row.ok_or(ConsentFailure::PendingMissing)?;
+    if expires <= now() {
+        return Err(ConsentFailure::PendingExpired);
+    }
+    if !equal(&expected, &hash(cookie)) {
+        return Err(ConsentFailure::CookieMismatch);
+    }
+    // The high-entropy owner key is checked before the failed-attempt budget:
+    // public clients must not be able to lock the legitimate owner out.
+    let owner_authorized = equal(&f.approval_secret, &s.config.owner);
+    if !owner_authorized {
+        let mut attempts = s.attempts.lock().map_err(|_| ConsentFailure::Validation)?;
+        while attempts.front().is_some_and(|t| *t <= now() - 3600) {
+            attempts.pop_front();
         }
-        // The high-entropy owner key is checked before the failed-attempt budget:
-        // public clients must not be able to lock the legitimate owner out.
-        let owner_authorized = equal(&f.approval_secret, &s.config.owner);
-        if !owner_authorized {
-            let mut attempts = s.attempts.lock().map_err(|_| anyhow::anyhow!("lock"))?;
-            while attempts.front().is_some_and(|t| *t <= now() - 3600) {
-                attempts.pop_front();
-            }
-            if attempts.len() >= 10 {
-                bail!("rate limit");
-            }
-            attempts.push_back(now());
-            drop(attempts);
+        if attempts.len() >= 10 {
+            return Err(ConsentFailure::Validation);
         }
-        tx.execute("DELETE FROM oauth_pending WHERE id=?1", [hash(&f.request)])?;
-        let a: Authorization = serde_json::from_str(&request)?;
-        if !s.validate_request(&a) {
-            bail!("denied");
-        }
-        if !owner_authorized {
-            tx.commit()?;
-            let mut u = Url::parse(&a.redirect_uri)?;
-            u.query_pairs_mut()
-                .append_pair("error", "access_denied")
-                .append_pair("state", &a.state)
-                .append_pair("iss", &s.config.issuer);
-            return Ok(u.into());
-        }
-        let code = random();
-        tx.execute(
-            "INSERT INTO oauth_codes VALUES(?1,?2,?3,?4)",
-            params![hash(&code), request, s.config.tag(), now() + 120],
-        )?;
+        attempts.push_back(now());
+        drop(attempts);
+    }
+    tx.execute("DELETE FROM oauth_pending WHERE id=?1", [hash(&f.request)])?;
+    let a: Authorization =
+        serde_json::from_str(&request).map_err(|_| ConsentFailure::Validation)?;
+    if !s.validate_request(&a) {
+        return Err(ConsentFailure::Validation);
+    }
+    if !owner_authorized {
         tx.commit()?;
-        let mut u = Url::parse(&a.redirect_uri)?;
+        let mut u = Url::parse(&a.redirect_uri).map_err(|_| ConsentFailure::Validation)?;
         u.query_pairs_mut()
-            .append_pair("code", &code)
+            .append_pair("error", "access_denied")
             .append_pair("state", &a.state)
             .append_pair("iss", &s.config.issuer);
-        Ok(u.into())
-    })();
-    match result {
+        return Ok(u.into());
+    }
+    let code = random();
+    tx.execute(
+        "INSERT INTO oauth_codes VALUES(?1,?2,?3,?4)",
+        params![hash(&code), request, s.config.tag(), now() + 120],
+    )?;
+    tx.commit()?;
+    let mut u = Url::parse(&a.redirect_uri).map_err(|_| ConsentFailure::Validation)?;
+    u.query_pairs_mut()
+        .append_pair("code", &code)
+        .append_pair("state", &a.state)
+        .append_pair("iss", &s.config.issuer);
+    Ok(u.into())
+}
+async fn consent(State(s): State<Arc<OAuth>>, h: HeaderMap, Form(f): Form<Consent>) -> Response {
+    match consent_location(&s, &h, &f) {
         Ok(location) => {
             let mut r = secure(StatusCode::SEE_OTHER.into_response());
             consent_csp(&s, &mut r);
@@ -577,7 +615,11 @@ async fn consent(State(s): State<Arc<OAuth>>, h: HeaderMap, Form(f): Form<Consen
             );
             r
         }
-        Err(_) => error(StatusCode::FORBIDDEN, "access_denied"),
+        Err(category) => {
+            // Static category only: never format errors, request values, or headers.
+            eprintln!("{}", category.diagnostic());
+            error(StatusCode::FORBIDDEN, "access_denied")
+        }
     }
 }
 async fn token(State(s): State<Arc<OAuth>>, h: HeaderMap, Form(f): Form<TokenForm>) -> Response {
@@ -677,6 +719,150 @@ mod tests {
             resource: Some(s.config.resource()),
             ..Default::default()
         }
+    }
+    fn pending_consent() -> (OAuth, HeaderMap, Consent) {
+        let s = server();
+        let f = Consent {
+            request: "synthetic-request-not-for-logs".into(),
+            approval_secret: s.config.owner.clone(),
+        };
+        let cookie = "synthetic-cookie-not-for-logs";
+        s.db.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO oauth_pending VALUES(?,?,?,?)",
+                params![
+                    hash(&f.request),
+                    hash(cookie),
+                    serde_json::to_string(&auth(&s)).unwrap(),
+                    now() + 300
+                ],
+            )
+            .unwrap();
+        let mut h = headers();
+        h.insert(header::ORIGIN, s.config.issuer.parse().unwrap());
+        h.insert(
+            header::COOKIE,
+            format!("__Host-discord-oauth={cookie}").parse().unwrap(),
+        );
+        (s, h, f)
+    }
+    #[tokio::test]
+    async fn consent_failures_are_classified_without_response_or_log_values() {
+        let cases = [
+            ConsentFailure::Host,
+            ConsentFailure::Origin,
+            ConsentFailure::PendingMissing,
+            ConsentFailure::PendingExpired,
+            ConsentFailure::CookieMismatch,
+            ConsentFailure::Database,
+            ConsentFailure::Validation,
+        ];
+        let logs = [
+            "oauth_consent_denied category=host",
+            "oauth_consent_denied category=origin",
+            "oauth_consent_denied category=pending_missing",
+            "oauth_consent_denied category=pending_expired",
+            "oauth_consent_denied category=cookie_mismatch",
+            "oauth_consent_denied category=db_error",
+            "oauth_consent_denied category=validation",
+        ];
+        for (expected, line) in cases.into_iter().zip(logs) {
+            let (s, mut h, f) = pending_consent();
+            match expected {
+                ConsentFailure::Host => {
+                    h.insert(header::HOST, "wrong-private-host.example".parse().unwrap());
+                }
+                ConsentFailure::Origin => {
+                    h.insert(
+                        header::ORIGIN,
+                        "https://wrong-private-origin.example".parse().unwrap(),
+                    );
+                }
+                ConsentFailure::PendingMissing => {
+                    s.db.lock()
+                        .unwrap()
+                        .execute("DELETE FROM oauth_pending", [])
+                        .unwrap();
+                }
+                ConsentFailure::PendingExpired => {
+                    s.db.lock()
+                        .unwrap()
+                        .execute("UPDATE oauth_pending SET expires=0", [])
+                        .unwrap();
+                }
+                ConsentFailure::CookieMismatch => {
+                    h.remove(header::COOKIE);
+                }
+                ConsentFailure::Database => {
+                    s.db.lock()
+                        .unwrap()
+                        .execute("DROP TABLE oauth_pending", [])
+                        .unwrap();
+                }
+                ConsentFailure::Validation => {
+                    s.db.lock()
+                        .unwrap()
+                        .execute(
+                            "UPDATE oauth_pending SET request=?",
+                            ["private-malformed-authorization-not-for-logs"],
+                        )
+                        .unwrap();
+                }
+            }
+            assert_eq!(consent_location(&s, &h, &f), Err(expected));
+            assert_eq!(expected.diagnostic(), line);
+            // Public failure remains generic, no diagnostic header or redirect.
+            let response = consent(State(Arc::new(s)), h, Form(f)).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(!response.headers().contains_key(header::LOCATION));
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..], br#"{"error":"access_denied"}"#);
+        }
+    }
+    #[test]
+    fn missing_origin_and_wrong_cookie_keep_distinct_safe_categories() {
+        let (s, mut h, f) = pending_consent();
+        h.remove(header::ORIGIN);
+        assert_eq!(consent_location(&s, &h, &f), Err(ConsentFailure::Origin));
+        h.insert(header::ORIGIN, s.config.issuer.parse().unwrap());
+        h.insert(
+            header::COOKIE,
+            "__Host-discord-oauth=wrong-secret-cookie".parse().unwrap(),
+        );
+        assert_eq!(
+            consent_location(&s, &h, &f),
+            Err(ConsentFailure::CookieMismatch)
+        );
+        assert!(s.attempts.lock().unwrap().is_empty());
+        assert_eq!(
+            s.db.lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM oauth_pending", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn consent_database_write_failure_is_generic_and_rolls_back() {
+        let (s, h, f) = pending_consent();
+        s.db.lock()
+            .unwrap()
+            .execute("DROP TABLE oauth_codes", [])
+            .unwrap();
+        assert_eq!(consent_location(&s, &h, &f), Err(ConsentFailure::Database));
+        assert_eq!(
+            s.db.lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM oauth_pending", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
     #[test]
     fn request_rejects_redirect_prefix_and_plain_pkce() {
