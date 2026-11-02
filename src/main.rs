@@ -874,6 +874,7 @@ impl Bridge {
             } else {
                 true
             };
+            let mut delivery_attempt = None;
             let status = if !grant_allowed {
                 410
             } else if !dm_ok {
@@ -884,7 +885,8 @@ impl Bridge {
                 } else {
                     None
                 };
-                webhook::post(
+                let attempt_at = now();
+                let http_status = webhook::post(
                     &s.url,
                     &self.config.callbacks,
                     &s.secret,
@@ -895,21 +897,36 @@ impl Bridge {
                     false,
                 )
                 .await
-                .map(|v| v.0)
-                .unwrap_or(0)
+                .ok()
+                .map(|response| response.0);
+                delivery_attempt = Some((attempt_at, tries, http_status));
+                http_status.unwrap_or(0)
             } else {
                 410
             };
-            let db = self.db.lock().unwrap();
-            if (200..300).contains(&status) {
-                typing::delivered(&db, &event["data"], &sid, self.config.typing_timeout_secs)?;
-            }
-            if (200..300).contains(&status)
-                || status == 410
+            let acknowledged = (200..300).contains(&status);
+            let terminal = status == 410
                 || status == 413
                 || ((400..500).contains(&status) && status != 408 && status != 429)
-                || tries >= 7
-            {
+                || tries >= 7;
+            if let Some((attempt_at, retry_count, http_status)) = delivery_attempt {
+                let outcome = if acknowledged {
+                    EventDeliveryOutcome::Acknowledged
+                } else if terminal {
+                    EventDeliveryOutcome::Terminal
+                } else {
+                    EventDeliveryOutcome::Retry
+                };
+                eprintln!(
+                    "{}",
+                    format_event_delivery_attempt(attempt_at, retry_count, http_status, outcome)
+                );
+            }
+            let db = self.db.lock().unwrap();
+            if acknowledged {
+                typing::delivered(&db, &event["data"], &sid, self.config.typing_timeout_secs)?;
+            }
+            if acknowledged || terminal {
                 db.execute("DELETE FROM queue WHERE sid=? AND eid=?", params![sid, eid])?;
                 if status == 410 {
                     db.execute("DELETE FROM subscriptions WHERE id=?", [&sid])?;
@@ -1064,6 +1081,30 @@ impl Bridge {
             _ => bail!("method_not_found"),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum EventDeliveryOutcome {
+    Acknowledged,
+    Retry,
+    Terminal,
+}
+
+fn format_event_delivery_attempt(
+    attempt_at: i64,
+    retry_count: i64,
+    http_status: Option<u16>,
+    outcome: EventDeliveryOutcome,
+) -> String {
+    let http_status = http_status.map_or_else(|| "none".to_owned(), |status| status.to_string());
+    let outcome = match outcome {
+        EventDeliveryOutcome::Acknowledged => "acknowledged",
+        EventDeliveryOutcome::Retry => "retry",
+        EventDeliveryOutcome::Terminal => "terminal",
+    };
+    format!(
+        "event_delivery attempt_at={attempt_at} retry_count={retry_count} http_status={http_status} outcome={outcome}"
+    )
 }
 
 async fn handle(
@@ -1314,6 +1355,35 @@ mod tests {
     }
     fn msg() -> Value {
         json!({"id":"333333333333333333","channel_id":"111111111111111111","author":{"id":"222222222222222222"},"content":"hello"})
+    }
+    #[test]
+    fn event_delivery_diagnostic_contains_only_delivery_metadata() {
+        assert_eq!(
+            format_event_delivery_attempt(1_793_610_490, 2, Some(503), EventDeliveryOutcome::Retry),
+            "event_delivery attempt_at=1793610490 retry_count=2 http_status=503 outcome=retry"
+        );
+        assert_eq!(
+            format_event_delivery_attempt(1_793_610_490, 0, None, EventDeliveryOutcome::Retry),
+            "event_delivery attempt_at=1793610490 retry_count=0 http_status=none outcome=retry"
+        );
+        assert_eq!(
+            format_event_delivery_attempt(
+                1_793_610_490,
+                0,
+                Some(204),
+                EventDeliveryOutcome::Acknowledged
+            ),
+            "event_delivery attempt_at=1793610490 retry_count=0 http_status=204 outcome=acknowledged"
+        );
+        assert_eq!(
+            format_event_delivery_attempt(
+                1_793_610_490,
+                7,
+                Some(410),
+                EventDeliveryOutcome::Terminal
+            ),
+            "event_delivery attempt_at=1793610490 retry_count=7 http_status=410 outcome=terminal"
+        );
     }
     #[test]
     fn filters_and_dedup() {
