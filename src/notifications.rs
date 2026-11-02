@@ -52,9 +52,6 @@ fn prepare(p: &Value, owner: &str) -> Result<Prepared> {
     let mention = p["mention_owner"]
         .as_bool()
         .context("Invalid mention selection")?;
-    if mention && importance != "important" {
-        bail!("Owner mention requires important notification");
-    }
     if text.trim().is_empty() {
         bail!("Notification text is empty");
     }
@@ -265,7 +262,7 @@ mod tests {
         }
     }
     #[test]
-    fn mentions_only_allow_explicit_important_owner() {
+    fn mentions_only_allow_explicit_configured_owner_at_any_importance() {
         let mut p = request("@everyone <@&123> <@999999999999999999>");
         let normal = payload(OWNER, &prepare(&p, OWNER).unwrap());
         assert_eq!(
@@ -273,7 +270,15 @@ mod tests {
             json!({"parse":[],"users":[],"roles":[],"replied_user":false})
         );
         p["mention_owner"] = json!(true);
-        assert!(prepare(&p, OWNER).is_err());
+        let normal_mention = payload(OWNER, &prepare(&p, OWNER).unwrap());
+        assert_eq!(
+            normal_mention["allowed_mentions"],
+            json!({"parse":[],"users":[OWNER],"roles":[],"replied_user":false})
+        );
+        assert!(normal_mention["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("<@{OWNER}> ")));
         p["importance"] = json!("important");
         let body = payload(OWNER, &prepare(&p, OWNER).unwrap());
         assert_eq!(body["allowed_mentions"]["users"], json!([OWNER]));

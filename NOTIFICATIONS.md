@@ -12,7 +12,7 @@ All four arguments are required:
 
 - No recipient ID, channel ID, arbitrary mentions configuration or attachment argument is accepted.
 - Destination is drawn only from a durable registry populated by verified, observed owner DMs (including startup migration of retained owner messages before their retention cleanup). Every new send fetches a fresh Discord channel descriptor, bypassing the ordinary DM cache, to verify that it is still that owner's one-to-one DM. If no destination has been learned, the owner must message the bot first. Multiple distinct candidates or missing/unverifiable channels fail closed. Candidate uniqueness is rechecked transactionally after network verification and before reserving a send. The tool does not create a new DM or send to server/group channels.
-- `importance` is `normal` or `important`. `mention_owner=true` requires `important`; the bridge itself prepends the configured owner's mention. Use only for genuinely important notices or decisions, not routine progress. `normal` plus false and `important` plus false suppress all mentions.
+- `importance` is `normal` or `important`. `mention_owner=true` works with either value; the bridge itself prepends the configured owner's mention. `normal` plus false and `important` plus false suppress all mentions.
 - Allowed mentions never enable automatic parsing, roles, everyone, or a user other than the configured owner. Discord/device notification preferences still govern visible/push alerts; delivery or a mention does not guarantee the owner saw it.
 - Text plus optional owner-tag prefix must fit **2,000 UTF-16 units**. Notifications are intentionally a single message; condense longer updates. Existing long `discord_reply` splitting is unaffected.
 
