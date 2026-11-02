@@ -587,7 +587,16 @@ impl Bridge {
                 bail!("Unauthorized grant");
             }
         }
-        let (id, channel, url) = self.identity_diagnosed(p, category)?;
+        let (id, channel, url) = self.identity_diagnosed(p, category).inspect_err(|_| {
+            if *category == SubscribeDiagnostic::CallbackPolicy {
+                if let Some(host) = p["delivery"]["url"]
+                    .as_str()
+                    .and_then(webhook::denied_callback_hostname)
+                {
+                    eprintln!("events_subscribe callback_policy_denied_hostname={host}");
+                }
+            }
+        })?;
         *category = SubscribeDiagnostic::Secret;
         let secret = string(&p["delivery"], "secret")?.to_owned();
         webhook::validate_secret(&secret)?;

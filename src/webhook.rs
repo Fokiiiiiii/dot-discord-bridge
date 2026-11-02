@@ -45,6 +45,37 @@ pub fn validate_url(value: &str, hosts: &HashSet<String>) -> Result<Url> {
     Ok(url)
 }
 
+/// Diagnostic only: never authorizes a destination or performs DNS/network I/O.
+/// Return only a parser-normalized, bounded ASCII DNS hostname. Invalid URL
+/// shapes (including userinfo, fragments and IP literals) disclose nothing.
+pub fn denied_callback_hostname(value: &str) -> Option<String> {
+    let parsed = Url::parse(value).ok()?;
+    let host = match parsed.host()? {
+        Host::Domain(host) => host,
+        _ => return None,
+    };
+    if host.len() > 253 {
+        return None;
+    }
+    let dns_name = host.strip_suffix('.').unwrap_or(host);
+    if dns_name.split('.').any(|label| {
+        label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    }) {
+        return None;
+    }
+    // Reuse all existing structural checks, with only the parsed host admitted
+    // in this local diagnostic validator. The real allowlist is never changed.
+    let diagnostic_hosts = HashSet::from([host.to_owned()]);
+    validate_url(value, &diagnostic_hosts).ok()?;
+    Some(host.to_owned())
+}
+
 fn public_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
     !(a == 0
@@ -191,6 +222,58 @@ async fn finish_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn denied_hostname_is_normalized_bounded_and_contains_no_url_data() {
+        assert_eq!(
+            denied_callback_hostname("https://CALLBACK.Example/private/path?token=never-log-this"),
+            Some("callback.example".to_owned())
+        );
+        assert_eq!(
+            denied_callback_hostname("https://b\u{fc}cher.example/path?q=private"),
+            Some("xn--bcher-kva.example".to_owned())
+        );
+        assert_eq!(
+            denied_callback_hostname("https://callback.example.:443/private"),
+            Some("callback.example.".to_owned())
+        );
+        let allowed = HashSet::from(["pending.invalid".to_owned()]);
+        let value = "https://callback.example/private?token=private";
+        assert!(validate_url(value, &allowed).is_err());
+        assert_eq!(
+            denied_callback_hostname(value).as_deref(),
+            Some("callback.example")
+        );
+        assert!(validate_url(value, &allowed).is_err());
+    }
+
+    #[test]
+    fn denied_hostname_rejects_invalid_shapes_ips_and_log_injection() {
+        for value in [
+            "http://callback.example/",
+            "https://user:password@callback.example/",
+            "https://callback.example/#private-fragment",
+            "https://callback.example:8443/",
+            "https://127.0.0.1/",
+            "https://2130706433/",
+            "https://[::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://callback.example\n/inject",
+            "https://callback.example\\@evil.example/",
+            "https://bad_host.example/",
+            "https://-bad.example/",
+            "https://bad-.example/",
+            "https://bad..example/",
+            "https://evil%0ahost.example/",
+            "not a URL",
+        ] {
+            assert!(denied_callback_hostname(value).is_none());
+        }
+        let long_label = format!("https://{}.example/", "a".repeat(64));
+        assert!(denied_callback_hostname(&long_label).is_none());
+        let long_host = format!("https://{0}.{0}.{0}.{0}/", "a".repeat(63));
+        assert!(denied_callback_hostname(&long_host).is_none());
+    }
+
     #[test]
     fn callback_urls_fail_closed() {
         let hosts = HashSet::from(["callback.example".to_owned()]);
