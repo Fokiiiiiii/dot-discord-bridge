@@ -31,6 +31,99 @@ use uuid::Uuid;
 
 const MAX_MCP_BODY: usize = 262144;
 const EVENT: &str = "discord.dm.created";
+// Only closed, static categories may reach subscription diagnostics. Never log
+// parameters, callback addresses, identifiers, credentials or underlying errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubscribeDiagnostic {
+    Received,
+    Grant,
+    Event,
+    Arguments,
+    Owner,
+    Delivery,
+    CallbackPolicy,
+    Secret,
+    Cursor,
+    Ttl,
+    VerificationStarted,
+    VerificationTransport,
+    VerificationTimeout,
+    VerificationDns,
+    VerificationDestination,
+    VerificationResponse,
+    VerificationStatus,
+    VerificationChallenge,
+    Database,
+    Accepted,
+}
+impl SubscribeDiagnostic {
+    fn line(self) -> &'static str {
+        match self {
+            Self::Received => "events_subscribe category=received",
+            Self::Grant => "events_subscribe category=grant",
+            Self::Event => "events_subscribe category=event",
+            Self::Arguments => "events_subscribe category=arguments",
+            Self::Owner => "events_subscribe category=owner",
+            Self::Delivery => "events_subscribe category=delivery",
+            Self::CallbackPolicy => "events_subscribe category=callback_policy",
+            Self::Secret => "events_subscribe category=secret",
+            Self::Cursor => "events_subscribe category=cursor",
+            Self::Ttl => "events_subscribe category=ttl",
+            Self::VerificationStarted => "events_subscribe category=verification_started",
+            Self::VerificationTransport => "events_subscribe category=verification_transport",
+            Self::VerificationTimeout => "events_subscribe category=verification_timeout",
+            Self::VerificationDns => "events_subscribe category=verification_dns",
+            Self::VerificationDestination => "events_subscribe category=verification_destination",
+            Self::VerificationResponse => "events_subscribe category=verification_response",
+            Self::VerificationStatus => "events_subscribe category=verification_status",
+            Self::VerificationChallenge => "events_subscribe category=verification_challenge",
+            Self::Database => "events_subscribe category=database",
+            Self::Accepted => "events_subscribe category=accepted",
+        }
+    }
+    fn transport(error: &anyhow::Error) -> Self {
+        match error.to_string().as_str() {
+            "callback_timeout" => Self::VerificationTimeout,
+            "Callback DNS lookup failed" => Self::VerificationDns,
+            "Non-public callback destination" => Self::VerificationDestination,
+            "Callback response failed" | "Callback response too large" => {
+                Self::VerificationResponse
+            }
+            _ => Self::VerificationTransport,
+        }
+    }
+}
+fn verify_subscription_response(
+    status: u16,
+    response: &[u8],
+    challenge: &str,
+    category: &mut SubscribeDiagnostic,
+) -> Result<()> {
+    *category = if (200..300).contains(&status) {
+        SubscribeDiagnostic::VerificationResponse
+    } else {
+        SubscribeDiagnostic::VerificationStatus
+    };
+    let echoed: Value =
+        serde_json::from_slice(response).map_err(|_| anyhow!("callback_verification_failed"))?;
+    *category = if (200..300).contains(&status) {
+        SubscribeDiagnostic::VerificationChallenge
+    } else {
+        SubscribeDiagnostic::VerificationStatus
+    };
+    if !(200..300).contains(&status)
+        || !bool::from(
+            echoed["challenge"]
+                .as_str()
+                .unwrap_or("")
+                .as_bytes()
+                .ct_eq(challenge.as_bytes()),
+        )
+    {
+        bail!("callback_verification_failed")
+    }
+    Ok(())
+}
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -439,19 +532,31 @@ impl Bridge {
         Ok(())
     }
     fn identity(&self, p: &Value) -> Result<(String, String, String)> {
+        self.identity_diagnosed(p, &mut SubscribeDiagnostic::Event)
+    }
+    fn identity_diagnosed(
+        &self,
+        p: &Value,
+        category: &mut SubscribeDiagnostic,
+    ) -> Result<(String, String, String)> {
+        *category = SubscribeDiagnostic::Event;
         if string(p, "name")? != EVENT {
             bail!("Unknown event")
         }
+        *category = SubscribeDiagnostic::Arguments;
         exact(&p["arguments"], &["owner_user_id"])?;
         let ch = string(&p["arguments"], "owner_user_id")?;
+        *category = SubscribeDiagnostic::Owner;
         if !self.config.users.contains(ch) {
             bail!("Owner not authorized")
         }
+        *category = SubscribeDiagnostic::Delivery;
         let delivery = &p["delivery"];
         if string(delivery, "mode")? != "webhook" {
             bail!("Only webhook delivery supported")
         }
         let url = string(delivery, "url")?;
+        *category = SubscribeDiagnostic::CallbackPolicy;
         webhook::validate_url(url, &self.config.callbacks)?;
         let identity = serde_json::to_vec(&json!(["owner",EVENT,{"owner_user_id":ch},url]))?;
         Ok((
@@ -464,17 +569,33 @@ impl Bridge {
         self.subscribe_with_grant(p, None).await
     }
     async fn subscribe_with_grant(&self, p: &Value, family: Option<&str>) -> Result<Value> {
+        eprintln!("{}", SubscribeDiagnostic::Received.line());
+        let mut category = SubscribeDiagnostic::Grant;
+        let result = self.subscribe_diagnosed(p, family, &mut category).await;
+        eprintln!("{}", category.line());
+        result
+    }
+    async fn subscribe_diagnosed(
+        &self,
+        p: &Value,
+        family: Option<&str>,
+        category: &mut SubscribeDiagnostic,
+    ) -> Result<Value> {
+        *category = SubscribeDiagnostic::Grant;
         if let Some(oauth) = &self.config.oauth {
             if !family.is_some_and(|f| oauth.grant_active(f)) {
                 bail!("Unauthorized grant");
             }
         }
-        let (id, channel, url) = self.identity(p)?;
+        let (id, channel, url) = self.identity_diagnosed(p, category)?;
+        *category = SubscribeDiagnostic::Secret;
         let secret = string(&p["delivery"], "secret")?.to_owned();
         webhook::validate_secret(&secret)?;
+        *category = SubscribeDiagnostic::Cursor;
         if !p["cursor"].is_null() {
             bail!("Replay not supported")
         }
+        *category = SubscribeDiagnostic::Ttl;
         let ttl = if p.get("ttlMs").is_none() || p["ttlMs"].is_null() {
             3_600_000
         } else {
@@ -496,8 +617,10 @@ impl Bridge {
             .unwrap_or(0)
             > now();
         if !verified {
+            *category = SubscribeDiagnostic::VerificationTransport;
             let challenge = Uuid::new_v4().to_string();
             let body = serde_json::to_vec(&json!({"type":"verification","challenge":challenge}))?;
+            eprintln!("{}", SubscribeDiagnostic::VerificationStarted.line());
             let (status, response) = webhook::post(
                 &url,
                 &self.config.callbacks,
@@ -510,37 +633,28 @@ impl Bridge {
             )
             .await
             .map_err(|e| {
+                *category = SubscribeDiagnostic::transport(&e);
                 anyhow!(if e.to_string() == "callback_timeout" {
                     "callback_timeout"
                 } else {
                     "callback_verification_failed"
                 })
             })?;
-            let echoed: Value = serde_json::from_slice(&response)
-                .map_err(|_| anyhow!("callback_verification_failed"))?;
-            if !(200..300).contains(&status)
-                || !bool::from(
-                    echoed["challenge"]
-                        .as_str()
-                        .unwrap_or("")
-                        .as_bytes()
-                        .ct_eq(challenge.as_bytes()),
-                )
-            {
-                bail!("callback_verification_failed")
-            }
+            verify_subscription_response(status, &response, &challenge, category)?;
             self.verified
                 .lock()
                 .unwrap()
                 .retain(|_, until| *until > now());
             self.verified.lock().unwrap().insert(cachekey, now() + 300);
         }
+        *category = SubscribeDiagnostic::Grant;
         if let Some(oauth) = &self.config.oauth {
             if !family.is_some_and(|f| oauth.grant_active(f)) {
                 bail!("Unauthorized grant");
             }
         }
         let expires = now() + seconds;
+        *category = SubscribeDiagnostic::Database;
         let mut db = self.db.lock().unwrap();
         let db = db.transaction()?;
         let previous: Option<(String, Option<String>, i64)> = db
@@ -568,6 +682,7 @@ impl Bridge {
             db.execute("DELETE FROM subscription_grants WHERE sid=?", [&id])?;
         }
         db.commit()?;
+        *category = SubscribeDiagnostic::Accepted;
         Ok(json!({"id":id,"refreshBefore":iso(expires),"cursor":null,"truncated":false}))
     }
     async fn unsubscribe(&self, p: &Value) -> Result<Value> {
@@ -1598,6 +1713,154 @@ mod lifecycle_tests {
             ))
         );
         b.verified.lock().unwrap().insert(key, now() + 300);
+    }
+    #[tokio::test]
+    async fn subscribe_diagnostics_preserve_validation_and_database_failures() {
+        use SubscribeDiagnostic as D;
+        let b = Bridge::new(":memory:", config()).unwrap();
+        let valid = params(&format!("whsec_{}", STANDARD.encode([1; 32])));
+        for (pointer, value, expected) in [
+            ("/name", json!("private-event-sentinel"), D::Event),
+            ("/arguments", json!({}), D::Arguments),
+            (
+                "/arguments/owner_user_id",
+                json!("private-owner-sentinel"),
+                D::Owner,
+            ),
+            (
+                "/delivery/mode",
+                json!("private-mode-sentinel"),
+                D::Delivery,
+            ),
+            (
+                "/delivery/url",
+                json!("https://evil.example/private?secret=sentinel"),
+                D::CallbackPolicy,
+            ),
+            (
+                "/delivery/secret",
+                json!("private-secret-sentinel"),
+                D::Secret,
+            ),
+        ] {
+            let mut p = valid.clone();
+            *p.pointer_mut(pointer).unwrap() = value;
+            let mut category = D::Received;
+            assert!(b
+                .subscribe_diagnosed(&p, None, &mut category)
+                .await
+                .is_err());
+            assert_eq!(category, expected);
+            assert!(!category.line().contains("sentinel"));
+        }
+        for (key, value, expected) in [
+            ("cursor", json!("private-cursor-sentinel"), D::Cursor),
+            ("ttlMs", json!(0), D::Ttl),
+            ("ttlMs", json!("private-ttl-sentinel"), D::Ttl),
+        ] {
+            let mut p = valid.clone();
+            p[key] = value;
+            let mut category = D::Received;
+            assert!(b
+                .subscribe_diagnosed(&p, None, &mut category)
+                .await
+                .is_err());
+            assert_eq!(category, expected);
+        }
+        let count: i64 =
+            b.db.lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM subscriptions", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(count, 0);
+        cached(&b, &valid);
+        let mut category = D::Received;
+        let result = b
+            .subscribe_diagnosed(&valid, None, &mut category)
+            .await
+            .unwrap();
+        assert_eq!(category, D::Accepted);
+        assert!(result["id"].is_string());
+        b.db.lock()
+            .unwrap()
+            .execute_batch("DROP TABLE subscriptions")
+            .unwrap();
+        assert!(b
+            .subscribe_diagnosed(&valid, None, &mut category)
+            .await
+            .is_err());
+        assert_eq!(category, D::Database);
+    }
+    #[test]
+    fn subscribe_verification_diagnostics_preserve_challenge_checks() {
+        use SubscribeDiagnostic as D;
+        for (status, body, expected) in [
+            (403, b"".as_slice(), D::VerificationStatus),
+            (
+                302,
+                br#"{"challenge":"synthetic"}"#.as_slice(),
+                D::VerificationStatus,
+            ),
+            (200, b"not-json".as_slice(), D::VerificationResponse),
+            (
+                200,
+                br#"{"challenge":"wrong"}"#.as_slice(),
+                D::VerificationChallenge,
+            ),
+            (200, b"{}".as_slice(), D::VerificationChallenge),
+        ] {
+            let mut category = D::Received;
+            let e =
+                verify_subscription_response(status, body, "synthetic", &mut category).unwrap_err();
+            assert_eq!(e.to_string(), "callback_verification_failed");
+            assert_eq!(category, expected);
+        }
+        let mut category = D::Received;
+        assert!(verify_subscription_response(
+            200,
+            br#"{"challenge":"synthetic"}"#,
+            "synthetic",
+            &mut category
+        )
+        .is_ok());
+    }
+    #[test]
+    fn subscribe_transport_diagnostics_are_closed_static_categories() {
+        use SubscribeDiagnostic as D;
+        for (error, expected) in [
+            ("callback_timeout", D::VerificationTimeout),
+            ("Callback DNS lookup failed", D::VerificationDns),
+            (
+                "Non-public callback destination",
+                D::VerificationDestination,
+            ),
+            ("Callback response too large", D::VerificationResponse),
+            ("Callback response failed", D::VerificationResponse),
+            (
+                "https://private.example/?token=private-secret-sentinel",
+                D::VerificationTransport,
+            ),
+        ] {
+            let category = D::transport(&anyhow!(error));
+            assert_eq!(category, expected);
+            assert!(!category.line().contains("sentinel"));
+            assert!(category.line().starts_with("events_subscribe category="));
+        }
+        assert_eq!(D::Received.line(), "events_subscribe category=received");
+        assert_eq!(D::Accepted.line(), "events_subscribe category=accepted");
+        assert_eq!(D::Grant.line(), "events_subscribe category=grant");
+        assert_eq!(
+            D::VerificationStarted.line(),
+            "events_subscribe category=verification_started"
+        );
+        assert_eq!(
+            D::VerificationStatus.line(),
+            "events_subscribe category=verification_status"
+        );
+        assert_eq!(
+            D::VerificationChallenge.line(),
+            "events_subscribe category=verification_challenge"
+        );
     }
     #[tokio::test]
     async fn refresh_rotation_and_unsubscribe() {
