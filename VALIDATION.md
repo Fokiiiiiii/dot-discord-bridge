@@ -85,3 +85,26 @@ Gateway sequence advances only after synchronous SQLite metadata commit. Offline
 - Added static-vocabulary/verification-only test and synthetic local HTTP mock that returns 200 headers then stalls, requiring body timeout to preserve `callback_timeout`. Existing localhost tests cover response bounds/permanent status handling. This does not constitute full outbound HTTPS challenge E2E coverage; existing MCP lifecycle test caches verification. No SSRF bypass introduced for testing.
 - cargo/rustc/rustfmt remain absent: new/full tests, fmt, Clippy and build UNVERIFIED in this environment. Run in the Mac build environment before any deployment. No deployment, production requests, credentials or configuration access.
 - Independent source review reports no blocking findings; phase positions and retained guards/errors inspected. Test does not capture stderr; the logging emitter accepts only static enum text.
+
+## Proactive owner notification extension (2026-11-02; NOT built here)
+
+- New authenticated `discord_notify_owner` tool with fixed configured owner, no destination arguments, explicit importance/owner-mention control and a single-message 2000 UTF-16-unit cap including the automatic owner tag. Existing reply/edit/event/security behavior retained.
+- Notification journals persist hash-only intent before POST; completed identical requests return recorded result, changed-key content conflicts reject, pending/uncertain writes never blindly replay. Content-free status adds notifications_pending/done counts.
+- Durable owner/channel-ID registry is populated only by validated owner-DM ingestion or a newly verified migration candidate. It survives message retention and restart. Multiple distinct candidates fail closed. Every new notification fetches a fresh channel descriptor without using the normal cached recipient check (explicit synthetic fixtures are compiled only in tests). Stored notification text is not retained.
+- Added ten module tests plus three integration tests: mention controls, Unicode and owner-tag length boundaries, arbitrary-destination rejection, payload conflicts, invalid returned IDs, pre-write persistence, disk restart/quarantine, registry retention and ambiguity, owner-only ingestion/registry retention, tool schema/routing and status counts. Expected source test count119; this is NOT an execution result.
+- No Rust toolchain in this environment. New/full tests, fmt, Clippy and release build remain UNVERIFIED. Run cargo fmt, cargo test --locked --offline, cargo clippy --all-targets --locked --offline -- -D warnings and cargo build --release --locked --offline in the Mac build environment before deployment. No live Discord, credentials, production configuration or deployment accessed.
+- Registry upgrade seeds existing owner message channel IDs at startup before cleanup; regression closes/reopens DB then deletes message rows. A transaction rechecks the unique destination after fresh verification before recording intent, rejecting concurrent ambiguity or replacement.
+- Independent source review: no outstanding blocking findings after startup-migration and post-verification ambiguity fixes. This is not a build or test-execution claim.
+
+## Presence extension (2026-11-02)
+
+
+- Added offline unit cases for static payloads, coalescing/rate spacing, multi-item queue semantics, failure precedence, and database-query failure; these tests were **not run** in this workspace because a Rust toolchain was not available on PATH or found in the workspace.
+- `cargo test --locked`, `cargo fmt --check`, Clippy and release build: **not run** for this extension. Earlier validation entries do not validate the changed source.
+- SQLite state-projection queries passed against a synthetic in-memory database; patch dry-run and archive integrity check passed.
+- Discord presence rendering, reconnection behavior, rate limits and live integration: **not tested**. No credentials or production state used.
+
+## Integrated source validation (2026-11-02)
+
+- Merged notification, attachment metadata, recovery, and presence changes into the verified notification source archive. Conflicting module declarations and documentation were manually combined; existing Gateway, DM authorization, outgoing journal and notification controls were preserved in the source.
+- Added unexecuted cross-feature assertions for tool discovery, attachment metadata plus owner-DM notification destination, and recovery driving presence state. Patch and archive integrity checks and static integration checks do not replace compilation or end-to-end tests. Rust toolchain unavailable: no integrated tests, formatting, Clippy, or release build were run. No live Discord or deployment was performed.

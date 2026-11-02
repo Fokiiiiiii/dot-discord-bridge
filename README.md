@@ -45,7 +45,7 @@ A source message with an uncertain write result is blocked from blind retry. Dis
 - A SQLite staging failure prevents sequence advancement and triggers a reconnect/resume; a processing DB failure stops the worker/process rather than being treated as an authorization error. Disk exhaustion still requires repair. A process crash before an event is durably staged, or loss of the resumable Gateway session, can still lose an event.
 - Gateway resume state is in-memory. Process restarts/expired sessions can miss messages; no historical replay. This is not a guaranteed-delivery messaging service.
 - Existing queued events whose channel verification temporarily fails use the bounded event retry policy. No data goes to the callback before verification succeeds.
-- No attachment retrieval, voice, slash commands, edits, history backfill, group DMs, server channels, sharding, or unsolicited outbound DMs.
+- Attachment metadata is signaled after DM verification, but attachment bytes and URLs are not retrieved or provided; see [feature details](FEATURES.md). No voice, slash commands, incoming-message edits, history backfill, group DMs, server channels, sharding, unauthorized proactive notices, or creation of new or arbitrary DM destinations. Explicitly authorized notices can be sent to the configured owner’s previously observed and freshly verified one-to-one DM.
 - Rotating/removing MCP credentials does not cancel existing subscriptions. Emergency revocation: stop the process and remove subscriptions before restarting with changed credentials.
 - Private plugin registration, real callback verification, real Discord DMs, and this dot's live reply remain unverified until approved hosting and credentials are provided.
 
@@ -63,3 +63,12 @@ Official references:
 ## Discord client features (v0.4.0)
 
 See [feature behavior and limits](FEATURES.md): bounded typing, multipart replies, source-bound edits, reply references, and configurable recent owner-DM context. All existing OAuth/recipient/SSRF/callback controls remain in place.
+
+## Proactive owner notifications
+
+The `discord_notify_owner` MCP tool sends an authorized standalone update only to the configured owner's previously observed and verified DM. Important updates/decisions can explicitly mention only that owner. Stable idempotency keys and a durable pre-send journal prevent blind retries after uncertain writes. See [NOTIFICATIONS.md](NOTIFICATIONS.md) for required parameters, limits and recovery boundaries. No scheduler, new recipient, deployment or configuration change is introduced.
+
+### Recovery tools
+
+
+`discord_bridge_diagnostics` lists bounded, content-free failed inbox, pending callback and uncertain outgoing metadata. `discord_retry_failed_inbox` is a narrowly scoped, explicit-owner-request retry of a recent failed inbox lookup, not a retry of an uncertain Discord write. Terminal callback failures are not retained. See [recovery behavior and limits](FEATURES.md#recovery-diagnostics-and-failed-inbox-retry).

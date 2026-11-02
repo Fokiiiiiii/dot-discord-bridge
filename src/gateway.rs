@@ -1,6 +1,7 @@
 //! Single-shard Discord Gateway v10 receiver; no token/body logging.
 //! Session state survives reconnects, not process restarts. The bridge does not
 //! promise replay across downtime. Run exactly one receiver for each bot token.
+use crate::presence::{self, Limiter, Presence};
 use anyhow::{anyhow, bail, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -94,9 +95,12 @@ fn auth_packet(token: &str, state: &State) -> Value {
         json!({"op":6,"d":{"token":token,"session_id":session,"seq":sequence}})
     } else {
         json!({"op":2,"d":{"token":token,"intents":INTENTS,
-            "properties":{"os":"linux","browser":"discord-dot-bridge","device":"discord-dot-bridge"}}})
+            "properties":{"os":"linux","browser":"discord-dot-bridge","device":"discord-dot-bridge"},
+            "presence":{"since":null,"activities":[{"name":"Bridge starting","type":0}],"status":"idle","afk":false}}})
     }
 }
+
+pub type PresenceSource = dyn Fn() -> Presence + Send + Sync;
 
 pub type Persist = dyn Fn(&Value) -> Result<()> + Send + Sync;
 
@@ -123,6 +127,8 @@ async fn connection(
     url: &str,
     state: &mut State,
     persist: &Persist,
+    presence: &PresenceSource,
+    limiter: &mut Limiter,
 ) -> Result<Outcome> {
     let (mut ws, _) = time::timeout(Duration::from_secs(30), connect_async(url)).await??;
     let hello = time::timeout(Duration::from_secs(20), ws.next())
@@ -139,10 +145,23 @@ async fn connection(
     );
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut acknowledged = true;
+    let mut ready = false;
+    let mut needs_refresh = true;
+    let mut presence_tick = time::interval(Duration::from_secs(2));
+    presence_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ws.send(Message::Text(auth_packet(token, state).to_string().into()))
         .await?;
     loop {
         tokio::select! {
+            _ = presence_tick.tick(), if ready => {
+                let desired = presence();
+                if limiter.should_send(desired, Instant::now(), needs_refresh) {
+                    // Reserve before sending: a transport error can be ambiguous.
+                    limiter.sent(desired, Instant::now());
+                    ws.send(Message::Text(presence::packet(desired).to_string().into())).await?;
+                    needs_refresh = false;
+                }
+            }
             _ = heartbeat.tick() => {
                 if !acknowledged {
                     // Dropping the socket (not normal close 1000) preserves resume.
@@ -187,6 +206,9 @@ async fn connection(
                                             .ok_or_else(|| anyhow!("Missing resume Gateway URL"))?)?);
                                 }
                                 persist_and_advance(&packet, state, persist)?;
+                                if matches!(packet["t"].as_str(), Some("READY" | "RESUMED")) {
+                                    ready = true;
+                                }
                             }
                             _ => (),
                         }
@@ -201,13 +223,18 @@ async fn connection(
 /// Persist MESSAGE_CREATE metadata synchronously before acknowledging sequence.
 /// The callback must perform only a short local durable write, with no network I/O.
 /// Fatal errors are intentionally generic and never include credentials or URLs.
-pub async fn run(token: String, persist: Arc<Persist>) -> Result<()> {
+pub async fn run(
+    token: String,
+    persist: Arc<Persist>,
+    presence: Arc<PresenceSource>,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()?;
     let mut state = State::default();
+    let mut limiter = Limiter::default();
     let mut base_url: Option<String> = None;
     let mut next_identify = Instant::now();
     let mut backoff = 1_u64;
@@ -292,7 +319,15 @@ pub async fn run(token: String, persist: Arc<Persist>) -> Result<()> {
             .ok_or_else(|| anyhow!("Missing Gateway endpoint"))?
             .clone();
         let connected_at = Instant::now();
-        let outcome = connection(&token, &url, &mut state, persist.as_ref()).await;
+        let outcome = connection(
+            &token,
+            &url,
+            &mut state,
+            persist.as_ref(),
+            presence.as_ref(),
+            &mut limiter,
+        )
+        .await;
         // Measure from the completed attempt as well, so a slow handshake cannot
         // compress the spacing between actual Identify packets.
         next_identify = Instant::now() + Duration::from_millis(5_100);
@@ -405,10 +440,15 @@ mod tests {
     fn identifies_then_resumes() {
         let mut state = State::default();
         assert_eq!(auth_packet("placeholder", &state)["op"], 2);
+        assert_eq!(
+            auth_packet("placeholder", &state)["d"]["presence"]["status"],
+            "idle"
+        );
         state.session = Some("session".into());
         state.sequence = Some(42);
         let resume = auth_packet("placeholder", &state);
         assert_eq!(resume["op"], 6);
+        assert!(resume["d"].get("presence").is_none());
         assert_eq!(resume["d"]["seq"], 42);
     }
     #[test]

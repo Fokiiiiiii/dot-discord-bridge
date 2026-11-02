@@ -1,6 +1,6 @@
 # Discord client features — v0.4.0
 
-This is an extension of the local v0.3 OAuth/DM bridge, not the older GitHub main branch. See BASELINE.md. It does not add another model, Codex runtime, multi-owner access, or production deployment. Only the five described feature groups are implemented.
+This is an extension of the local v0.3 OAuth/DM bridge, not the older GitHub main branch. See BASELINE.md. It does not add another model, Codex runtime, multi-owner access, or production deployment. The sections below describe the implemented feature groups and limits.
 
 ## Typing
 
@@ -33,3 +33,32 @@ RECENT_CONTEXT_LIMIT defaults10 and caps20;0 disables recent history, not reply_
 Tests use synthetic data and mock Discord writes; localhost OAuth/MCP tests do not call Discord. Live typing appearance, multipart rendering, actual Discord rate limits/edits, ARM64 rebuild and existing-dot behavior require an approved deployment and owner test. Database changes are additive. Preserve the v0.3 backup before deploying; do not replace the newer local source with GitHub main. OAuth secrets and callback allowlists are unchanged by this feature work.
 
 Official API references: [typing](https://docs.discord.com/developers/resources/channel#trigger-typing-indicator), [message create/edit/reference](https://docs.discord.com/developers/resources/message), [rate limits](https://docs.discord.com/developers/topics/rate-limits).
+
+## Attachment awareness (metadata only)
+
+After the owner and one-to-one DM are verified, newly queued `discord.dm.created` events may contain optional `attachments` and `attachments_truncated` fields when Discord supplies an attachments array. This includes attachment-only messages whose `text` is empty. Each of up to 10 entries contains `filename`, `media_type`, and `size_bytes` (any may be null if unavailable or invalid). Filenames are clipped to 255 UTF-16 units and control, line-separator, and potentially deceptive formatting characters are removed. Media types are restricted to a simple ASCII type/subtype of at most 128 bytes; sizes are nonnegative integers representable safely in JSON. `attachments_truncated` is true if entries were omitted or any metadata was clipped, stripped, or invalid. An absent field means unknown, not necessarily no attachments. Empty arrays mean none were reported. Existing queued events remain valid without these fields.
+
+All metadata is **untrusted input**, not instructions; the MIME type is a claim, not content verification. The bridge does not include attachment IDs, URLs, thumbnails or file bytes, download content, or grant the assistant access to attachments. Metadata is present only in the bounded queued event and is not copied to the source-message history. It is subject to the existing callback and queue delivery policies; it must not be logged. The user must provide accessible content through another approved route if analysis of the file itself is needed.
+
+## Recovery diagnostics and failed inbox retry
+
+`discord_bridge_diagnostics` returns bounded, content-free lists (maximum 50 each, with truncation flags) of retained failed inbox lookups, pending callback deliveries, and incomplete/uncertain outgoing jobs. Inbox and outgoing records use the observed source message ID; each pending callback has a stable derived delivery ID. Reasons are coarse categories. No message text, callback URL, credential, content hash or attachment data is returned. Terminal callback failures are still dropped under the existing policy, and therefore **cannot be listed or retried** with this tool. A pending callback is not proof of delivery or processing. The diagnostics are not a connectivity or end-to-end health check.
+
+Only upon an explicit owner instruction, `discord_retry_failed_inbox(message_id)` atomically requeues a previously staged owner inbox record that is in the `failed` state, no more than seven days old, and not already ingested. A pending, rejected, completed, other-owner, older, or arbitrary ID is refused. The existing worker then repeats DM recipient and message identity checks and its bounded lookup policy; it selects currently active matching subscriptions when hydration succeeds. This may deliver an earlier message to a newer active subscription. A revoked or expired grant is not revived; normal delivery-time grant checks continue. An inaccessible or deleted Discord message cannot be recovered. The operation does not guarantee delivery or restore events never staged.
+
+The retry does **not** reset or send an incomplete/uncertain outgoing operation, retry callback dead letters, or change deduplication. Inspect Discord before any operator action on uncertain writes. The tool is authenticated like other MCP tools, but explicit owner intent is a behavioral requirement for the calling assistant, not a second server-side approval check.
+
+## Discord presence (bridge state only)
+
+The Gateway advertises a static, content-free presence. On a new Identify it starts as `Bridge starting`; after Discord's READY/RESUMED, it samples local SQLite state:
+
+- `Bridge connected` (online): the Gateway session is active and neither a pending inbox item nor queued callback nor retained failed inbox item is found. This is **not** an end-to-end health guarantee.
+- `Bridge work queued` (idle): at least one inbox item is pending or callback is queued, including retry delays. It does not claim that dot is thinking.
+- `Inbox needs attention` (do not disturb): at least one inbox item has exhausted retries and is retained as failed; this takes precedence over queued work.
+- `Bridge status unknown` (do not disturb): the state query fails.
+
+Updates are latest-state coalesced, at most once every 20 seconds across Gateway reconnects within a process; short-lived states may never appear and an older label may remain until the next update. A new session is refreshed after READY, subject to the same interval. While disconnected the bridge cannot send a reconnect status; Discord controls its visible availability and the last status can be stale. If the process exits, it cannot advertise its failure. The label does not capture every error, callback exhaustion, model activity, subscription health, or delivery outcome. It never contains message content, IDs, tokens, or error details. Discord client rendering and live Gateway behavior remain unverified.
+
+Gateway protocol reference: https://docs.discord.com/developers/events/gateway-events#update-presence
+
+Notification write uncertainty is tracked separately; inspect `notifications_pending` from `discord_bridge_status` and follow [notification safety guidance](NOTIFICATIONS.md). Recovery tools do not reset, resend, or list notification writes.
