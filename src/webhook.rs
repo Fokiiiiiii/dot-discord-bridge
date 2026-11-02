@@ -123,6 +123,41 @@ fn signature(secret: &str, eid: &str, timestamp: &str, body: &[u8]) -> Result<St
     ))
 }
 
+// Closed vocabulary only: no callback or request data can enter phase logs.
+#[derive(Clone, Copy)]
+enum VerificationPhase {
+    DnsStart,
+    DnsSuccess,
+    RequestStart,
+    HeadersReceived,
+    BodyComplete,
+    DnsTimeout,
+    RequestTimeout,
+    BodyTimeout,
+}
+impl VerificationPhase {
+    fn line(self, verification: bool) -> Option<&'static str> {
+        if !verification {
+            return None;
+        }
+        Some(match self {
+            Self::DnsStart => "callback_verification phase=dns_start",
+            Self::DnsSuccess => "callback_verification phase=dns_success",
+            Self::RequestStart => "callback_verification phase=request_start",
+            Self::HeadersReceived => "callback_verification phase=headers_received",
+            Self::BodyComplete => "callback_verification phase=body_complete",
+            Self::DnsTimeout => "callback_verification timeout_phase=dns",
+            Self::RequestTimeout => "callback_verification timeout_phase=request",
+            Self::BodyTimeout => "callback_verification timeout_phase=body",
+        })
+    }
+    fn emit(self, verification: bool) {
+        if let Some(line) = self.line(verification) {
+            eprintln!("{line}");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn post(
     url: &str,
@@ -142,14 +177,19 @@ pub async fn post(
         .host_str()
         .context("Missing callback hostname")?
         .to_owned();
+    VerificationPhase::DnsStart.emit(verification);
     let addresses: Vec<SocketAddr> = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::net::lookup_host((host.as_str(), 443)),
     )
     .await
-    .map_err(|_| anyhow!("callback_timeout"))?
+    .map_err(|_| {
+        VerificationPhase::DnsTimeout.emit(verification);
+        anyhow!("callback_timeout")
+    })?
     .map_err(|_| anyhow!("Callback DNS lookup failed"))?
     .collect();
+    VerificationPhase::DnsSuccess.emit(verification);
     if addresses.is_empty() || addresses.iter().any(|a| !is_public(a.ip())) {
         bail!("Non-public callback destination");
     }
@@ -172,6 +212,7 @@ pub async fn post(
         sig.push(' ');
         sig.push_str(&signature(old, eid, &ts, body)?);
     }
+    VerificationPhase::RequestStart.emit(verification);
     let response = client
         .post(url)
         .header("Content-Type", "application/json")
@@ -184,6 +225,7 @@ pub async fn post(
         .await
         .map_err(|e| {
             anyhow!(if e.is_timeout() {
+                VerificationPhase::RequestTimeout.emit(verification);
                 "callback_timeout"
             } else {
                 "Callback request failed"
@@ -196,6 +238,7 @@ async fn finish_response(
     mut response: reqwest::Response,
     verification: bool,
 ) -> Result<(u16, Vec<u8>)> {
+    VerificationPhase::HeadersReceived.emit(verification);
     let status = response.status().as_u16();
     // Event acknowledgments depend on status only. Never let an oversized, slow,
     // or broken response body turn permanent 410/413 into a transient retry.
@@ -206,6 +249,7 @@ async fn finish_response(
     let mut response_body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| {
         anyhow!(if e.is_timeout() {
+            VerificationPhase::BodyTimeout.emit(verification);
             "callback_timeout"
         } else {
             "Callback response failed"
@@ -216,12 +260,37 @@ async fn finish_response(
         }
         response_body.extend_from_slice(&chunk);
     }
+    VerificationPhase::BodyComplete.emit(verification);
     Ok((status, response_body))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn verification_phase_diagnostics_are_static_and_verification_only() {
+        use VerificationPhase as P;
+        for (phase, expected) in [
+            (P::DnsStart, "callback_verification phase=dns_start"),
+            (P::DnsSuccess, "callback_verification phase=dns_success"),
+            (P::RequestStart, "callback_verification phase=request_start"),
+            (
+                P::HeadersReceived,
+                "callback_verification phase=headers_received",
+            ),
+            (P::BodyComplete, "callback_verification phase=body_complete"),
+            (P::DnsTimeout, "callback_verification timeout_phase=dns"),
+            (
+                P::RequestTimeout,
+                "callback_verification timeout_phase=request",
+            ),
+            (P::BodyTimeout, "callback_verification timeout_phase=body"),
+        ] {
+            assert_eq!(phase.line(true), Some(expected));
+            assert_eq!(phase.line(false), None);
+        }
+    }
+
     #[test]
     fn denied_hostname_is_normalized_bounded_and_contains_no_url_data() {
         assert_eq!(
@@ -427,6 +496,34 @@ mod response_tests {
         assert_eq!(result.0, 410);
         server.abort();
     }
+    #[tokio::test]
+    async fn verification_body_timeout_keeps_public_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let error = finish_response(response, true).await.unwrap_err();
+        server.abort();
+        assert_eq!(error.to_string(), "callback_timeout");
+    }
+
     #[tokio::test]
     async fn verification_body_is_still_bounded() {
         let r = response(200, &vec![b'x'; 70000], 70000).await;
