@@ -53,11 +53,62 @@ pub fn diagnostics(b: &Bridge, args: &Value) -> Result<Value> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let outgoing_truncated = outgoing.len() > LIMIT;
     outgoing.truncate(LIMIT);
+    drop(stmt);
+    let dest_channels = crate::notifications::candidate_channels(&db, owner).unwrap_or_default();
+    let dest_count = dest_channels.len();
+    let dest_status = match dest_count {
+        0 => "missing",
+        1 => "ready",
+        _ => "ambiguous",
+    };
+    let mut stmt = db.prepare(
+        "SELECT created FROM notifications WHERE state<>'done' ORDER BY created DESC LIMIT 20",
+    )?;
+    let uncertain_notifications = stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .map(|row| row.map(|created| json!({"age_seconds": now().saturating_sub(created).max(0)})))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut stmt = db.prepare(
+        "SELECT source FROM file_sends WHERE state<>'done' ORDER BY length(source),source LIMIT 20",
+    )?;
+    let uncertain_file_sends = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .map(|row| row.map(|source| json!({"message_id": source})))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut stmt =
+        db.prepare("SELECT tool,stage,reason,at FROM tool_failures ORDER BY id DESC LIMIT 20")?;
+    let recent_tool_failures = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .map(|row| {
+            row.map(|(tool, stage, reason, at)| {
+                json!({
+                    "tool": tool,
+                    "stage": stage,
+                    "reason": reason,
+                    "age_seconds": now().saturating_sub(at).max(0)
+                })
+            })
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(
         json!({"failed_inbox":inbox,"failed_inbox_truncated":inbox_truncated,
         "pending_callbacks":queue,"pending_callbacks_truncated":queue_truncated,
         "terminal_callback_failure_history_available":false,
-        "uncertain_outgoing":outgoing,"uncertain_outgoing_truncated":outgoing_truncated}),
+        "uncertain_outgoing":outgoing,"uncertain_outgoing_truncated":outgoing_truncated,
+        "notification_destination_status":dest_status,
+        "notification_destination_count":dest_count,
+        "uncertain_notifications":uncertain_notifications,
+        "uncertain_file_sends":uncertain_file_sends,
+        "recent_tool_failures":recent_tool_failures}),
     )
 }
 

@@ -1,4 +1,4 @@
-//! Bounded untrusted attachment metadata; never fetch or forward attachment URLs.
+//! Bounded untrusted attachment metadata and verified-source content retrieval.
 use serde_json::{json, Value};
 
 const MAX_ATTACHMENTS: usize = 10;
@@ -127,5 +127,162 @@ mod tests {
         augment(&json!({"attachments":[]}), &mut data);
         assert_eq!(data["attachments"], json!([]));
         assert_eq!(data["attachments_truncated"], false);
+    }
+}
+
+/// Return image blocks when magic bytes identify a supported image; all claims in
+/// the Discord metadata remain untrusted. Other files use an MCP resource.
+fn content_block(mid: &str, index: usize, bytes: &[u8]) -> Value {
+    use base64::Engine;
+    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    };
+    if let Some(mime) = mime {
+        return json!({"type":"image","mimeType":mime,"data":base64::engine::general_purpose::STANDARD.encode(bytes)});
+    }
+    let uri = format!("discord-attachment://{mid}/{index}");
+    if bytes.starts_with(b"%PDF-") {
+        return json!({"type":"resource","resource":{"uri":uri,"mimeType":"application/pdf","blob":base64::engine::general_purpose::STANDARD.encode(bytes)}});
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text.contains('\0') {
+            return json!({"type":"resource","resource":{"uri":uri,"mimeType":"text/plain","text":text}});
+        }
+    }
+    json!({"type":"resource","resource":{"uri":uri,"mimeType":"application/octet-stream","blob":base64::engine::general_purpose::STANDARD.encode(bytes)}})
+}
+
+fn valid_cdn_url(url: &url::Url, channel: &str, id: &str) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("cdn.discordapp.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+        && url
+            .path()
+            .starts_with(&format!("/attachments/{channel}/{id}/"))
+}
+
+/// Read an attachment belonging to a freshly verified, previously observed owner DM.
+/// The URL is taken only from Discord's authenticated message response, never the caller.
+pub async fn read(b: &crate::Bridge, p: &Value) -> anyhow::Result<Value> {
+    use anyhow::{bail, Context};
+    crate::exact(p, &["message_id", "index"])?;
+    let mid = crate::string(p, "message_id")?;
+    if !crate::snowflake(mid) {
+        bail!("Invalid message");
+    }
+    let index = p["index"]
+        .as_u64()
+        .filter(|v| *v < 10)
+        .context("Invalid attachment index")? as usize;
+    let (channel, author): (String, String) =
+        b.db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT channel,author FROM messages WHERE id=?",
+                [mid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .context("Source not observed")?;
+    if !b.can_respond(&author) {
+        bail!("Unauthorized source");
+    }
+    b.ensure_channel(&channel).await?;
+    let message = b
+        .discord_get(&format!("channels/{channel}/messages/{mid}"))
+        .await?;
+    if message["id"].as_str() != Some(mid)
+        || message["channel_id"].as_str() != Some(&channel)
+        || message["author"]["id"].as_str() != Some(&author)
+        || (!b.config.guild_enabled && !message["guild_id"].is_null())
+        || message["author"]["bot"].as_bool() == Some(true)
+        || !message["webhook_id"].is_null()
+    {
+        bail!("Message identity mismatch");
+    }
+    let item = message["attachments"]
+        .as_array()
+        .and_then(|a| a.get(index))
+        .context("Attachment unavailable")?;
+    const LIMIT: usize = 20 * 1024 * 1024;
+    if item["size"]
+        .as_u64()
+        .filter(|n| *n < LIMIT as u64)
+        .is_none()
+    {
+        bail!("Attachment exceeds size limit");
+    }
+    let id = item["id"]
+        .as_str()
+        .filter(|s| crate::snowflake(s))
+        .context("Invalid attachment")?;
+    let url = url::Url::parse(item["url"].as_str().context("Attachment unavailable")?)?;
+    if !valid_cdn_url(&url, &channel, id) {
+        bail!("Invalid attachment location");
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+    let mut response = client.get(url).send().await?.error_for_status()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() >= LIMIT {
+            bail!("Attachment exceeds size limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() as u64 != item["size"].as_u64().unwrap() {
+        bail!("Attachment size mismatch");
+    }
+    let mut changed = false;
+    let name = filename(&item["filename"], &mut changed).unwrap_or_else(|| "attachment".into());
+    Ok(
+        json!({"content":[content_block(mid,index,&bytes),{"type":"text","text":format!("Attachment: {name}")}]}),
+    )
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    #[test]
+    fn returns_content_types_based_on_bytes_not_declared_metadata() {
+        let png = content_block("333333333333333333", 0, b"\x89PNG\r\n\x1a\nexample");
+        assert_eq!(png["type"], "image");
+        assert_eq!(png["mimeType"], "image/png");
+        let pdf = content_block("333333333333333333", 0, b"%PDF-1.7\nexample");
+        assert_eq!(pdf["resource"]["mimeType"], "application/pdf");
+        let text = content_block("333333333333333333", 0, "日本語".as_bytes());
+        assert_eq!(text["resource"]["text"], "日本語");
+        let bytes = content_block("333333333333333333", 0, b"\x00\xff");
+        assert_eq!(bytes["resource"]["mimeType"], "application/octet-stream");
+    }
+    #[test]
+    fn only_matching_discord_cdn_attachment_is_accepted() {
+        let channel = "123456789012345678";
+        let id = "987654321098765432";
+        let good = format!("https://cdn.discordapp.com/attachments/{channel}/{id}/file.txt?ex=123");
+        assert!(valid_cdn_url(&url::Url::parse(&good).unwrap(), channel, id));
+        for bad in [
+            good.replace("cdn.discordapp.com", "cdn.discordapp.com.evil.test"),
+            good.replace(channel, "123456789012345679"),
+            good.replace(id, "987654321098765433"),
+            good.replace("https:", "http:"),
+            format!("{good}#fragment"),
+        ] {
+            assert!(!valid_cdn_url(&url::Url::parse(&bad).unwrap(), channel, id));
+        }
     }
 }

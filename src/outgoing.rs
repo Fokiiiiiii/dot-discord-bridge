@@ -60,8 +60,9 @@ impl Transport for Discord<'_> {
     ) -> Result<Option<String>> {
         let b = self.0;
         b.check_rest_cooldown()?;
-        b.ensure_dm(channel).await?;
+        b.ensure_channel(channel).await?;
         let client = reqwest::Client::builder()
+            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(20))
@@ -164,11 +165,11 @@ async fn execute<T: Transport>(b: &Bridge, p: &Value, editing: bool, t: &T) -> R
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .context("Reply target not observed")?;
-    if !b.config.users.contains(&author) {
+    if !b.can_respond(&author) {
         bail!("Reply not authorized");
     }
-    b.ensure_dm(&channel).await?;
-    if !b.is_verified_dm(&channel) {
+    b.ensure_channel(&channel).await?;
+    if !b.is_verified_channel(&channel) {
         bail!("Reply recipient not verified");
     }
     b.check_rest_cooldown()?;
@@ -683,6 +684,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let response = reqwest::Client::builder()
+            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
             .no_proxy()
             .build()
             .unwrap()

@@ -37,11 +37,7 @@ fn prepare(p: &Value, owner: &str) -> Result<Prepared> {
         &["idempotency_key", "text", "importance", "mention_owner"],
     )?;
     let key = string(p, "idempotency_key")?;
-    if !(1..=128).contains(&key.len())
-        || !key
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b':'))
-    {
+    if !(1..=128).contains(&key.len()) || !key.bytes().all(|c| c.is_ascii_graphic()) {
         bail!("Invalid notification idempotency key");
     }
     let text = string(p, "text")?;
@@ -87,6 +83,7 @@ impl Transport for Discord<'_> {
         let b = self.0;
         b.check_rest_cooldown()?;
         let client = reqwest::Client::builder()
+            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(20))
@@ -135,15 +132,22 @@ impl Transport for Discord<'_> {
         Ok(id.to_owned())
     }
 }
-fn candidate(db: &Connection, owner: &str) -> Result<String> {
+pub(crate) fn candidate_channels(db: &Connection, owner: &str) -> Result<Vec<String>> {
     let mut query = db.prepare(
-        "SELECT channel FROM notification_destinations WHERE owner=?1 UNION SELECT channel FROM messages WHERE author=?1 ORDER BY channel LIMIT 2",
+        "SELECT channel FROM notification_destinations WHERE owner=?1 UNION SELECT channel FROM messages WHERE author=?1 AND COALESCE(json_extract(body, '$.is_guild'), 0)=0 ORDER BY channel LIMIT 2",
     )?;
     let channels = query
         .query_map([owner], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(channels)
+}
+fn candidate(db: &Connection, owner: &str) -> Result<String> {
+    let channels = candidate_channels(db, owner)?;
+    if channels.is_empty() {
+        bail!("No previously observed owner DM (One previously observed owner DM required)");
+    }
     if channels.len() != 1 {
-        bail!("One previously observed owner DM required");
+        bail!("Multiple previously observed owner DM candidates (One previously observed owner DM required)");
     }
     Ok(channels[0].clone())
 }
@@ -401,6 +405,7 @@ mod tests {
         let inspect = Inspect(&b, Mutex::new(0));
         assert!(execute(&b, &request("hello"), &inspect).await.is_err());
         assert_eq!(*inspect.1.lock().unwrap(), 1);
+        drop(inspect);
         let config = b.config;
         drop(b.db);
         let reopened = Bridge::new(path.to_str().unwrap(), config).unwrap();
@@ -516,5 +521,22 @@ mod tests {
             .unwrap();
         assert!(execute(&b, &request("hello"), &t).await.is_err());
         assert!(t.calls.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn guild_messages_in_history_do_not_make_owner_dm_ambiguous() {
+        let b = bridge();
+        let t = mock(false);
+        b.db.lock()
+            .unwrap()
+            .execute(
+                r#"INSERT INTO messages VALUES('444444444444444444','1563460728818630698',?,'{"is_guild":true}',?)"#,
+                params![OWNER, now()],
+            )
+            .unwrap();
+        let result = execute(&b, &request("hello after guild message"), &t)
+            .await
+            .unwrap();
+        assert_eq!(result["channel_id"], CHANNEL);
+        assert_eq!(t.calls.lock().unwrap().len(), 1);
     }
 }

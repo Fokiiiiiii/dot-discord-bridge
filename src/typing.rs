@@ -60,7 +60,10 @@ pub fn prune(db: &Connection) -> Result<()> {
 }
 fn active(b: &Bridge, source: &str, sid: &str) -> Result<bool> {
     let db = b.db.lock().unwrap();
-    let valid:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM typing_leases t JOIN messages m ON m.id=t.source JOIN subscriptions s ON s.id=t.sid WHERE t.source=? AND t.state='active' AND t.expires>? AND s.expires>? AND m.author=? AND m.channel=t.channel AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.source=t.source))",params![source,now(),now(),b.config.users.iter().next().unwrap()],|r|r.get(0))?;
+    let author: Option<String> = db.query_row("SELECT m.author FROM typing_leases t JOIN messages m ON m.id=t.source JOIN subscriptions s ON s.id=t.sid WHERE t.source=? AND t.state='active' AND t.expires>? AND s.expires>? AND m.channel=t.channel AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.source=t.source)", params![source,now(),now()], |r| r.get(0)).optional()?;
+    let valid = author
+        .as_deref()
+        .is_some_and(|author| b.can_respond(author));
     if !valid {
         return Ok(false);
     }
@@ -127,7 +130,7 @@ pub async fn tick(b: &Bridge) -> Result<()> {
         if due > now() {
             continue;
         }
-        if b.ensure_dm(&channel).await.is_err() {
+        if b.ensure_channel(&channel).await.is_err() {
             finish(&b.db.lock().unwrap(), &source)?;
             continue;
         }
@@ -139,6 +142,7 @@ pub async fn tick(b: &Bridge) -> Result<()> {
             continue;
         }
         let client = reqwest::Client::builder()
+            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(3))

@@ -94,7 +94,7 @@ fn auth_packet(token: &str, state: &State) -> Value {
     if let (Some(session), Some(sequence)) = (&state.session, state.sequence) {
         json!({"op":6,"d":{"token":token,"session_id":session,"seq":sequence}})
     } else {
-        json!({"op":2,"d":{"token":token,"intents":INTENTS,
+        json!({"op":2,"d":{"token":token,"intents":INTENTS | if std::env::var("DISCORD_GUILD_ENABLED").as_deref() == Ok("true") { (1 << 9) | (1 << 15) } else { 0 },
             "properties":{"os":"linux","browser":"discord-dot-bridge","device":"discord-dot-bridge"},
             "presence":{"since":null,"activities":[{"name":"Bridge starting","type":0}],"status":"idle","afk":false}}})
     }
@@ -229,6 +229,7 @@ pub async fn run(
     presence: Arc<PresenceSource>,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
+        .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
