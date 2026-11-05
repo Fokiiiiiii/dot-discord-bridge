@@ -39,7 +39,7 @@ Optional variables:
 | Variable | Default | Description |
 |---|---|---|
 | `DISCORD_GUILD_ENABLED` | `false` | Set `true` to allow guild channel messages (requires Bot Message Content Intent) |
-| `DISCORD_RESPONDERS_FILE` | unset | Path to JSON file with `{"allow_user_ids":[...]}` (reloaded without restart) |
+| `DISCORD_RESPONDERS_FILE` | unset | Path to JSON array of allowed user ID strings `["222222222222222222", ...]` (include owner ID; reloaded without restart) |
 | `TYPING_TIMEOUT_SECS` | `120` | Max typing indicator lease in seconds (`0`–`300`) |
 | `RECENT_CONTEXT_LIMIT` | `10` | Recent same-channel messages included in events (`0`–`20`) |
 
