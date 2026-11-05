@@ -400,7 +400,6 @@ mod tests {
         let inspect = Inspect(&b, Mutex::new(0));
         assert!(execute(&b, &request("hello"), &inspect).await.is_err());
         assert_eq!(*inspect.1.lock().unwrap(), 1);
-        drop(inspect);
         let config = b.config;
         drop(b.db);
         let reopened = Bridge::new(path.to_str().unwrap(), config).unwrap();

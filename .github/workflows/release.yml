@@ -37,8 +37,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            arch: amd64
             use_cross: false
           - target: aarch64-unknown-linux-gnu
+            arch: arm64
             use_cross: true
     steps:
       - uses: actions/checkout@v4
@@ -65,8 +67,9 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME:-v0.5.0}"
           STAGE="${BINARY_NAME}-${VERSION}-${{ matrix.target }}"
-          mkdir -p "${STAGE}"
+          mkdir -p "${STAGE}" "bin/linux-${{ matrix.arch }}"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${STAGE}/"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "bin/linux-${{ matrix.arch }}/${BINARY_NAME}"
           cp README.md .env.example Dockerfile "${STAGE}/"
           cp -r deploy plugin-template "${STAGE}/"
           tar -czf "${STAGE}.tar.gz" "${STAGE}"
@@ -79,13 +82,34 @@ jobs:
           path: |
             *.tar.gz
             *.tar.gz.sha256
+            bin/linux-${{ matrix.arch }}/${BINARY_NAME}
 
   docker:
     name: Publish Multi-Arch Container (GHCR)
-    needs: verify
+    needs: build-archive
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: .
+          merge-multiple: true
+      - name: Prepare runtime Dockerfile
+        run: |
+          chmod +x bin/linux-amd64/${BINARY_NAME} bin/linux-arm64/${BINARY_NAME}
+          cat << 'EOF' > Dockerfile.release
+          FROM debian:bookworm-slim
+          ARG TARGETARCH
+          RUN groupadd --gid 10001 bridge && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin bridge               && mkdir /data && chown 10001:10001 /data && chmod 700 /data
+          COPY bin/linux-${TARGETARCH}/discord-dot-bridge /usr/local/bin/discord-dot-bridge
+          USER 10001:10001
+          WORKDIR /data
+          ENV DATABASE_PATH=/data/discord-dm.sqlite3 PORT=8787
+          HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["/usr/local/bin/discord-dot-bridge", "--healthcheck"]
+          ENTRYPOINT ["/bin/sh", "-c", "umask 077; exec /usr/local/bin/discord-dot-bridge"]
+          EOF
+          echo '!bin/' >> .dockerignore
+          echo '!bin/**' >> .dockerignore
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Log in to GitHub Container Registry
@@ -107,12 +131,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: ${{ startsWith(github.ref, 'refs/tags/v') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   github-release:
     name: Publish GitHub Release
