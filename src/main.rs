@@ -973,6 +973,7 @@ impl Bridge {
             } else {
                 true
             };
+            let mut delivery_attempt = None;
             let status = if !grant_allowed {
                 410
             } else if !dm_ok {
@@ -983,7 +984,8 @@ impl Bridge {
                 } else {
                     None
                 };
-                webhook::post(
+                let attempt_at = now();
+                let http_status = webhook::post(
                     &s.url,
                     &self.config.callbacks,
                     &s.secret,
@@ -994,21 +996,36 @@ impl Bridge {
                     false,
                 )
                 .await
-                .map(|v| v.0)
-                .unwrap_or(0)
+                .ok()
+                .map(|response| response.0);
+                delivery_attempt = Some((attempt_at, tries, http_status));
+                http_status.unwrap_or(0)
             } else {
                 410
             };
-            let db = self.db.lock().unwrap();
-            if (200..300).contains(&status) {
-                typing::delivered(&db, &event["data"], &sid, self.config.typing_timeout_secs)?;
-            }
-            if (200..300).contains(&status)
-                || status == 410
+            let acknowledged = (200..300).contains(&status);
+            let terminal = status == 410
                 || status == 413
                 || ((400..500).contains(&status) && status != 408 && status != 429)
-                || tries >= 7
-            {
+                || tries >= 7;
+            if let Some((attempt_at, retry_count, http_status)) = delivery_attempt {
+                let outcome = if acknowledged {
+                    EventDeliveryOutcome::Acknowledged
+                } else if terminal {
+                    EventDeliveryOutcome::Terminal
+                } else {
+                    EventDeliveryOutcome::Retry
+                };
+                eprintln!(
+                    "{}",
+                    format_event_delivery_attempt(attempt_at, retry_count, http_status, outcome)
+                );
+            }
+            let db = self.db.lock().unwrap();
+            if acknowledged {
+                typing::delivered(&db, &event["data"], &sid, self.config.typing_timeout_secs)?;
+            }
+            if acknowledged || terminal {
                 db.execute("DELETE FROM queue WHERE sid=? AND eid=?", params![sid, eid])?;
                 if status == 410 {
                     db.execute("DELETE FROM subscriptions WHERE id=?", [&sid])?;
