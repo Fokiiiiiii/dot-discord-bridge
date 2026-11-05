@@ -2,7 +2,7 @@
 //! Does not send messages, reset outgoing journals, or revive subscriptions.
 use crate::{exact, now, snowflake, string, Bridge};
 use anyhow::{bail, Result};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -27,12 +27,33 @@ pub fn diagnostics(b: &Bridge, args: &Value) -> Result<Value> {
     exact(args, &[])?;
     let db = b.db.lock().unwrap();
     let owner = b.config.users.iter().next().unwrap();
-    let mut stmt = db.prepare("SELECT id,tries,received,COALESCE(last_error,'') FROM inbox WHERE status='failed' AND author=? ORDER BY received,id LIMIT 51")?;
-    let mut inbox = stmt.query_map([owner], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))?
-        .map(|row| row.map(|(id,tries,received,reason)| json!({"message_id":id,"attempts":tries,"age_seconds":now().saturating_sub(received).max(0),"reason":safe_reason(&reason)})))
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let inbox_truncated = inbox.len() > LIMIT;
-    inbox.truncate(LIMIT);
+    let mut stmt = db.prepare(
+        "SELECT id,author,tries,received,COALESCE(last_error,'') FROM inbox WHERE status='failed' ORDER BY received,id",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut inbox = Vec::new();
+    let mut inbox_truncated = false;
+    while let Some(r) = rows.next()? {
+        let author: String = r.get(1)?;
+        if !b.can_respond(&author) {
+            continue;
+        }
+        if inbox.len() == LIMIT {
+            inbox_truncated = true;
+            break;
+        }
+        let id: String = r.get(0)?;
+        let tries: i64 = r.get(2)?;
+        let received: i64 = r.get(3)?;
+        let reason: String = r.get(4)?;
+        inbox.push(json!({
+            "message_id": id,
+            "attempts": tries,
+            "age_seconds": now().saturating_sub(received).max(0),
+            "reason": safe_reason(&reason)
+        }));
+    }
+    drop(rows);
     drop(stmt);
     // Terminal callback failures are deleted by the existing delivery policy;
     // do not present pending events as a failed-event history.
@@ -120,10 +141,19 @@ pub fn retry_failed_inbox(b: &Bridge, args: &Value) -> Result<Value> {
     if !snowflake(id) {
         bail!("Invalid message ID");
     }
-    let owner = b.config.users.iter().next().unwrap();
     let t = now();
     let db = b.db.lock().unwrap();
-    let n = db.execute("UPDATE inbox SET status='pending',tries=0,due=?1,last_error=NULL WHERE id=?2 AND author=?3 AND status='failed' AND received>=?4 AND received<=?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.id=inbox.id)", params![t,id,owner,t-MAX_RETRY_AGE])?;
+    let author: Option<String> = db
+        .query_row(
+            "SELECT author FROM inbox WHERE id=?1 AND status='failed'",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(author) = author.filter(|a| b.can_respond(a)) else {
+        bail!("Message is not eligible for retry");
+    };
+    let n = db.execute("UPDATE inbox SET status='pending',tries=0,due=?1,last_error=NULL WHERE id=?2 AND author=?3 AND status='failed' AND received>=?4 AND received<=?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.id=inbox.id)", params![t,id,author,t-MAX_RETRY_AGE])?;
     if n != 1 {
         bail!("Message is not eligible for retry");
     }

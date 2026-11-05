@@ -8,14 +8,23 @@ const MAX_TEXT: usize = 2000;
 const MAX_TOTAL: usize = 16000;
 const RETENTION: i64 = 7 * 86400;
 
-fn clipped(s: &str, max: usize) -> String {
-    let mut n = 0;
-    s.chars()
+fn clipped(s: &str, max: usize) -> (String, usize, bool) {
+    let mut units = 0;
+    let mut truncated = false;
+    let out: String = s
+        .chars()
         .take_while(|c| {
-            n += c.len_utf16();
-            n <= max
+            let len = c.len_utf16();
+            if units + len <= max {
+                units += len;
+                true
+            } else {
+                truncated = true;
+                false
+            }
         })
-        .collect()
+        .collect();
+    (out, units, truncated)
 }
 fn valid_id(s: &str) -> bool {
     (15..=22).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
@@ -26,7 +35,8 @@ fn stamp(t: i64) -> String {
         .unwrap_or_default()
 }
 fn entry(id: &str, role: &str, author: Option<&str>, text: &str, t: i64) -> Value {
-    json!({"message_id":id,"role":role,"author_id":author,"text":clipped(text,MAX_TEXT),"text_truncated":text.encode_utf16().count()>MAX_TEXT,"timestamp":stamp(t)})
+    let (clipped_text, _, text_truncated) = clipped(text, MAX_TEXT);
+    json!({"message_id":id,"role":role,"author_id":author,"text":clipped_text,"text_truncated":text_truncated,"timestamp":stamp(t)})
 }
 fn owned_reply(
     db: &Connection,
@@ -190,12 +200,10 @@ fn augment_at(
     rows.truncate(limit);
     let mut remaining = MAX_TOTAL;
     for (_, _, v) in &mut rows {
-        let s = clipped(v["text"].as_str().unwrap_or(""), remaining);
-        let was_clipped =
-            v["text"].as_str().unwrap_or("").encode_utf16().count() > s.encode_utf16().count();
+        let (s, units, was_clipped) = clipped(v["text"].as_str().unwrap_or(""), remaining);
         v["text_truncated"] = json!(v["text_truncated"] == true || was_clipped);
         truncated |= v["text_truncated"] == true;
-        remaining = remaining.saturating_sub(s.encode_utf16().count());
+        remaining = remaining.saturating_sub(units);
         v["text"] = json!(s);
     }
     rows.retain(|(_, _, v)| v["text"].as_str().is_some_and(|s| !s.is_empty()));
