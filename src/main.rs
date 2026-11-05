@@ -216,6 +216,7 @@ struct Config {
 }
 struct Bridge {
     db: Mutex<Connection>,
+    http: reqwest::Client,
     config: Config,
     reply_lock: AsyncMutex<()>,
     subscribe_lock: AsyncMutex<()>,
@@ -254,6 +255,7 @@ impl Bridge {
             bail!("Exactly one Discord owner user ID is required");
         }
         let db = Connection::open(path)?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
         let existing: i64 = db.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='messages'",
             [],
@@ -301,7 +303,12 @@ impl Bridge {
             "INSERT OR IGNORE INTO bridge_metadata VALUES('owner_user_id',?)",
             [owner],
         )?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS tool_failures(id INTEGER PRIMARY KEY AUTOINCREMENT,at INTEGER NOT NULL,tool TEXT NOT NULL,stage TEXT NOT NULL,reason TEXT NOT NULL);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS tool_failures(id INTEGER PRIMARY KEY AUTOINCREMENT,at INTEGER NOT NULL,tool TEXT NOT NULL,stage TEXT NOT NULL,reason TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_inbox_status_due_received ON inbox(status, due, received);
+        CREATE INDEX IF NOT EXISTS idx_queue_due ON queue(due);
+        CREATE INDEX IF NOT EXISTS idx_messages_author_channel_received ON messages(author, channel, received);
+        CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received);
+        CREATE INDEX IF NOT EXISTS idx_tool_failures_at ON tool_failures(at);")?;
         outgoing::init(&db)?;
         file_send::init(&db)?;
         notifications::init(&db)?;
@@ -326,8 +333,15 @@ impl Bridge {
             .collect();
         #[cfg(not(test))]
         let dm_verified = HashMap::new();
+        let http = reqwest::Client::builder()
+            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(20))
+            .build()?;
         Ok(Self {
             db: Mutex::new(db),
+            http,
             config,
             reply_lock: AsyncMutex::new(()),
             subscribe_lock: AsyncMutex::new(()),
@@ -386,14 +400,10 @@ impl Bridge {
     }
     async fn discord_get(&self, path: &str) -> Result<Value> {
         self.check_rest_cooldown()?;
-        let client = reqwest::Client::builder()
-            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
-        let mut response = client
+        let mut response = self
+            .http
             .get(format!("https://discord.com/api/v10/{path}"))
+            .timeout(std::time::Duration::from_secs(10))
             .header("Authorization", format!("Bot {}", self.config.bot))
             .send()
             .await
@@ -1623,20 +1633,33 @@ async fn main() -> Result<()> {
     let presence = Arc::new(move || presence::sample(&presence_bridge));
     let worker = b.clone();
     let delivery = async move {
+        let mut ticks: u64 = 0;
         loop {
-            worker.process_inbox().await?;
-            worker.deliver_once().await?;
-            {
-                let db = worker.db.lock().unwrap();
-                outgoing::prune(&db, now() - 7 * 86400)?;
-                typing::prune(&db)?;
-                db.execute("DELETE FROM messages WHERE received<?", [now() - 7 * 86400])?;
-                db.execute(
-                    "DELETE FROM inbox WHERE received<? AND status IN ('done','rejected')",
-                    [now() - 7 * 86400],
-                )?;
-                db.execute("DELETE FROM subscriptions WHERE expires<?", [now()])?;
+            if let Err(err) = worker.process_inbox().await {
+                eprintln!(
+                    "{}",
+                    json!({"event":"worker_error","worker":"inbox","reason":classify_tool_error("worker_inbox",&err).1})
+                );
             }
+            if let Err(err) = worker.deliver_once().await {
+                eprintln!(
+                    "{}",
+                    json!({"event":"worker_error","worker":"delivery","reason":classify_tool_error("worker_delivery",&err).1})
+                );
+            }
+            if ticks.is_multiple_of(60) {
+                let db = worker.db.lock().unwrap();
+                let cutoff = now() - 7 * 86400;
+                let _ = outgoing::prune(&db, cutoff);
+                let _ = typing::prune(&db);
+                let _ = db.execute("DELETE FROM messages WHERE received<?", [cutoff]);
+                let _ = db.execute(
+                    "DELETE FROM inbox WHERE received<? AND status IN ('done','rejected')",
+                    [cutoff],
+                );
+                let _ = db.execute("DELETE FROM subscriptions WHERE expires<?", [now()]);
+            }
+            ticks = ticks.wrapping_add(1);
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         #[allow(unreachable_code)]
@@ -1645,7 +1668,12 @@ async fn main() -> Result<()> {
     let typer = b.clone();
     let typing_worker = async move {
         loop {
-            typing::tick(&typer).await?;
+            if let Err(err) = typing::tick(&typer).await {
+                eprintln!(
+                    "{}",
+                    json!({"event":"worker_error","worker":"typing","reason":classify_tool_error("worker_typing",&err).1})
+                );
+            }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         #[allow(unreachable_code)]

@@ -3,7 +3,7 @@ use crate::{now, params, Bridge, Connection, OptionalExtension, Result};
 use serde_json::Value;
 
 pub fn init(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS typing_leases(source TEXT PRIMARY KEY,channel TEXT NOT NULL,sid TEXT NOT NULL,expires INTEGER NOT NULL,state TEXT NOT NULL,created INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS typing_channels(channel TEXT PRIMARY KEY,next_due INTEGER NOT NULL);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS typing_leases(source TEXT PRIMARY KEY,channel TEXT NOT NULL,sid TEXT NOT NULL,expires INTEGER NOT NULL,state TEXT NOT NULL,created INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS typing_channels(channel TEXT PRIMARY KEY,next_due INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_typing_leases_state_expires ON typing_leases(state, expires); CREATE INDEX IF NOT EXISTS idx_typing_leases_created ON typing_leases(created);")?;
     // Never resume cosmetic typing after process restart.
     db.execute(
         "UPDATE typing_leases SET state='stopped' WHERE state='active'",
@@ -49,7 +49,7 @@ pub fn stop_subscription(db: &Connection, sid: &str) -> Result<()> {
 }
 pub fn prune(db: &Connection) -> Result<()> {
     db.execute(
-        "UPDATE typing_leases SET state='stopped' WHERE expires<=?",
+        "UPDATE typing_leases SET state='stopped' WHERE state='active' AND expires<=?",
         [now()],
     )?;
     db.execute(
@@ -141,16 +141,12 @@ pub async fn tick(b: &Bridge) -> Result<()> {
         if !reserve_channel(&b.db.lock().unwrap(), &channel, now())? {
             continue;
         }
-        let client = reqwest::Client::builder()
-            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(3))
-            .build()?;
-        let response = client
+        let response = b
+            .http
             .post(format!(
                 "https://discord.com/api/v10/channels/{channel}/typing"
             ))
+            .timeout(std::time::Duration::from_secs(3))
             .header("Authorization", format!("Bot {}", b.config.bot))
             .send()
             .await;

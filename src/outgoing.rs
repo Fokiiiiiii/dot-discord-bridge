@@ -6,12 +6,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub fn init(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS outgoing_parts(source TEXT NOT NULL,part INTEGER NOT NULL,message_id TEXT NOT NULL,content TEXT,updated INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(source,part)); CREATE TABLE IF NOT EXISTS outgoing_jobs(source TEXT PRIMARY KEY,kind TEXT NOT NULL,content_hash TEXT NOT NULL,state TEXT NOT NULL,result TEXT); CREATE TABLE IF NOT EXISTS outgoing_writes(id TEXT PRIMARY KEY,source TEXT NOT NULL,part INTEGER NOT NULL,kind TEXT NOT NULL,target TEXT,content_hash TEXT,state TEXT NOT NULL,created INTEGER NOT NULL);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS outgoing_parts(source TEXT NOT NULL,part INTEGER NOT NULL,message_id TEXT NOT NULL,content TEXT,updated INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(source,part)); CREATE TABLE IF NOT EXISTS outgoing_jobs(source TEXT PRIMARY KEY,kind TEXT NOT NULL,content_hash TEXT NOT NULL,state TEXT NOT NULL,result TEXT); CREATE TABLE IF NOT EXISTS outgoing_writes(id TEXT PRIMARY KEY,source TEXT NOT NULL,part INTEGER NOT NULL,kind TEXT NOT NULL,target TEXT,content_hash TEXT,state TEXT NOT NULL,created INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_outgoing_parts_updated_notnull ON outgoing_parts(updated) WHERE content IS NOT NULL; CREATE INDEX IF NOT EXISTS idx_outgoing_jobs_state ON outgoing_jobs(state); CREATE INDEX IF NOT EXISTS idx_outgoing_writes_state ON outgoing_writes(state);")?;
     Ok(())
 }
 pub fn prune(db: &Connection, cutoff: i64) -> Result<()> {
     db.execute(
-        "UPDATE outgoing_parts SET content=NULL WHERE updated<?",
+        "UPDATE outgoing_parts SET content=NULL WHERE content IS NOT NULL AND updated<?",
         [cutoff],
     )?;
     Ok(())
@@ -61,12 +61,7 @@ impl Transport for Discord<'_> {
         let b = self.0;
         b.check_rest_cooldown()?;
         b.ensure_channel(channel).await?;
-        let client = reqwest::Client::builder()
-            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(20))
-            .build()?;
+        let client = &b.http;
         let base = format!("https://discord.com/api/v10/channels/{channel}/messages");
         let mentions = json!({"parse":[],"replied_user":false});
         let request = match action {

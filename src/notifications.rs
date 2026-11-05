@@ -82,17 +82,12 @@ impl Transport for Discord<'_> {
     async fn write(&self, channel: &str, body: &Value) -> Result<String> {
         let b = self.0;
         b.check_rest_cooldown()?;
-        let client = reqwest::Client::builder()
-            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(|_| anyhow!("Notification transport setup failed"))?;
-        let mut response = client
+        let mut response = b
+            .http
             .post(format!(
                 "https://discord.com/api/v10/channels/{channel}/messages"
             ))
+            .timeout(std::time::Duration::from_secs(20))
             .header("Authorization", format!("Bot {}", b.config.bot))
             .json(body)
             .send()

@@ -37,30 +37,34 @@ pub async fn apply(b: &Bridge, p: &Value) -> Result<Value> {
     let endpoint = format!(
         "https://discord.com/api/v10/channels/{channel}/messages/{id}/reactions/{encoded}/@me"
     );
-    let client = reqwest::Client::builder()
-        .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15))
-        .build()?;
     let req = if action == "add" {
-        client.put(endpoint)
+        b.http.put(endpoint)
     } else {
-        client.delete(endpoint)
+        b.http.delete(endpoint)
     };
-    let response = req
+    let mut response = req
+        .timeout(Duration::from_secs(15))
         .header("Authorization", format!("Bot {}", b.config.bot))
         .send()
         .await?;
     if response.status().as_u16() == 429 {
-        b.set_rest_cooldown(crate::retry_delay(
-            response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok()),
-            None,
-        ));
+        let retry_header = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
+        b.set_rest_cooldown(crate::retry_delay(retry_header, None));
+        let mut bytes = Vec::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            if bytes.len() + chunk.len() > 65536 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let delay = crate::retry_delay(retry_header, body["retry_after"].as_f64());
+        b.set_rest_cooldown(delay);
+        return Err(crate::lookup_failure(false, "discord_rate_limited", delay));
     }
     if response.status().as_u16() != 204 {
         bail!("Discord reaction not confirmed");

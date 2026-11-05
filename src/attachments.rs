@@ -230,13 +230,13 @@ pub async fn read(b: &crate::Bridge, p: &Value) -> anyhow::Result<Value> {
     if !valid_cdn_url(&url, &channel, id) {
         bail!("Invalid attachment location");
     }
-    let client = reqwest::Client::builder()
-        .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
+    let mut response = b
+        .http
+        .get(url)
         .timeout(std::time::Duration::from_secs(20))
-        .build()?;
-    let mut response = client.get(url).send().await?.error_for_status()?;
+        .send()
+        .await?
+        .error_for_status()?;
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         if bytes.len() + chunk.len() >= LIMIT {

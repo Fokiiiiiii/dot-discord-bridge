@@ -89,16 +89,12 @@ pub async fn send(b: &Bridge, p: &Value) -> Result<Value> {
     let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n{payload}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").into_bytes();
     body.extend_from_slice(&data);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    let client = reqwest::Client::builder()
-        .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let mut res = client
+    let mut res = b
+        .http
         .post(format!(
             "https://discord.com/api/v10/channels/{channel}/messages"
         ))
+        .timeout(std::time::Duration::from_secs(30))
         .header("Authorization", format!("Bot {}", b.config.bot))
         .header(
             "Content-Type",

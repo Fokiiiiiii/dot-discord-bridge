@@ -195,7 +195,7 @@ impl OAuth {
     fn new(config: Config, db: Connection) -> Result<Self> {
         config.validate()?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS oauth_pending(id TEXT PRIMARY KEY,cookie TEXT NOT NULL,request TEXT NOT NULL,expires INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS oauth_codes(code TEXT PRIMARY KEY,request TEXT NOT NULL,tag TEXT NOT NULL,expires INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS oauth_tokens(token TEXT PRIMARY KEY,kind TEXT NOT NULL,family TEXT NOT NULL,tag TEXT NOT NULL,expires INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS oauth_revoked(family TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS oauth_used_codes(code TEXT PRIMARY KEY,tag TEXT NOT NULL,family TEXT NOT NULL);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS oauth_pending(id TEXT PRIMARY KEY,cookie TEXT NOT NULL,request TEXT NOT NULL,expires INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS oauth_codes(code TEXT PRIMARY KEY,request TEXT NOT NULL,tag TEXT NOT NULL,expires INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS oauth_tokens(token TEXT PRIMARY KEY,kind TEXT NOT NULL,family TEXT NOT NULL,tag TEXT NOT NULL,expires INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS oauth_revoked(family TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS oauth_used_codes(code TEXT PRIMARY KEY,tag TEXT NOT NULL,family TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_oauth_tokens_family_tag_expires ON oauth_tokens(family, tag, expires); CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expires ON oauth_tokens(expires); CREATE INDEX IF NOT EXISTS idx_oauth_codes_expires ON oauth_codes(expires); CREATE INDEX IF NOT EXISTS idx_oauth_pending_expires ON oauth_pending(expires);")?;
         Ok(Self {
             config,
             db: Mutex::new(db),
@@ -302,6 +302,8 @@ impl OAuth {
         let access = random();
         let refresh = random();
         let t = now();
+        db.execute("DELETE FROM oauth_tokens WHERE expires<=?1", [t])?;
+        db.execute("DELETE FROM oauth_codes WHERE expires<=?1", [t])?;
         db.execute(
             "INSERT INTO oauth_tokens(token,kind,family,tag,expires) VALUES(?1,'access',?2,?3,?4)",
             params![hash(&access), family, tag, t + 900],
@@ -1187,5 +1189,45 @@ mod tests {
             .to_str()
             .unwrap()
             .starts_with("Basic "));
+    }
+    #[test]
+    fn issue_prunes_expired_tokens_and_codes_while_preserving_active_family() {
+        let s = server();
+        let v1 = s.exchange(&grant(&s)).unwrap();
+        {
+            let db = s.db.lock().unwrap();
+            db.execute("UPDATE oauth_tokens SET expires=0 WHERE kind='access'", [])
+                .unwrap();
+            db.execute(
+                "INSERT INTO oauth_codes(code,request,tag,expires) VALUES('expired_code','{}','tag',0)",
+                [],
+            )
+            .unwrap();
+        }
+        let f = TokenForm {
+            grant_type: Some("refresh_token".into()),
+            refresh_token: Some(v1["refresh_token"].as_str().unwrap().into()),
+            resource: Some(s.config.resource()),
+            ..Default::default()
+        };
+        let v2 = s.exchange(&f).unwrap();
+        assert!(s.authorize_bearer(v2["access_token"].as_str().unwrap()));
+        let db = s.db.lock().unwrap();
+        let expired_tokens: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM oauth_tokens WHERE expires<=?1",
+                [now()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expired_codes: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM oauth_codes WHERE expires<=?1",
+                [now()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(expired_tokens, 0);
+        assert_eq!(expired_codes, 0);
     }
 }
