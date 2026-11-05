@@ -37,6 +37,11 @@ use uuid::Uuid;
 
 const MAX_MCP_BODY: usize = 29 * 1024 * 1024;
 const EVENT: &str = "discord.dm.created";
+pub(crate) const USER_AGENT: &str = concat!(
+    "DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, ",
+    env!("CARGO_PKG_VERSION"),
+    ")"
+);
 // Only closed, static categories may reach subscription diagnostics. Never log
 // parameters, callback addresses, identifiers, credentials or underlying errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,6 +312,7 @@ impl Bridge {
         CREATE INDEX IF NOT EXISTS idx_inbox_status_due_received ON inbox(status, due, received);
         CREATE INDEX IF NOT EXISTS idx_queue_due ON queue(due);
         CREATE INDEX IF NOT EXISTS idx_messages_author_channel_received ON messages(author, channel, received);
+        CREATE INDEX IF NOT EXISTS idx_messages_owner_dm_channel ON messages(author, channel) WHERE COALESCE(json_extract(body, '$.is_guild'), 0)=0;
         CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received);
         CREATE INDEX IF NOT EXISTS idx_tool_failures_at ON tool_failures(at);")?;
         outgoing::init(&db)?;
@@ -334,7 +340,7 @@ impl Bridge {
         #[cfg(not(test))]
         let dm_verified = HashMap::new();
         let http = reqwest::Client::builder()
-            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
+            .user_agent(USER_AGENT)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(20))
@@ -1096,7 +1102,7 @@ impl Bridge {
     async fn rpc(&self, method: &str, p: &Value) -> Result<Value> {
         match method {
             "initialize" => Ok(
-                json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{},"events":{}},"serverInfo":{"name":"discord-dot-bridge","version":"0.4.0"}}),
+                json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{},"events":{}},"serverInfo":{"name":"discord-dot-bridge","version":env!("CARGO_PKG_VERSION")}}),
             ),
             "ping" => Ok(json!({})),
             "events/list" => Ok(
@@ -3506,6 +3512,103 @@ mod dm_tests {
             db.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+    #[tokio::test]
+    async fn benchmark_core_paths() {
+        use std::time::Instant;
+
+        // 1. Splitter (short & 15,000-char fenced code markdown)
+        let short_msg = "Hello owner, this is a concise Discord DM reply.";
+        let t0 = Instant::now();
+        for _ in 0..10_000 {
+            let parts = splitter::split(short_msg).unwrap();
+            assert_eq!(parts.len(), 1);
+        }
+        let split_short_us = t0.elapsed().as_secs_f64() * 1e6 / 10_000.0;
+
+        let long_msg = format!(
+            "# Analysis Report\n\n```rust\n{}\n```\n\n{}",
+            "fn compute(x: u64) -> u64 { x.wrapping_mul(6364136223846793005).wrapping_add(1) }\n"
+                .repeat(120),
+            "Paragraph of detailed technical explanation with Unicode 日本語テキスト and metrics.\n"
+                .repeat(80)
+        );
+        let t0 = Instant::now();
+        for _ in 0..1_000 {
+            let parts = splitter::split(&long_msg).unwrap();
+            assert!(parts.len() >= 7);
+        }
+        let split_long_us = t0.elapsed().as_secs_f64() * 1e6 / 1_000.0;
+
+        // 2. Stage raw + ingest + context augmentation (with 500 stored messages & SQLite indexes)
+        let b = Bridge::new(":memory:", cfg()).unwrap();
+        b.accept_dm_descriptor("111111111111111111", &descriptor())
+            .unwrap();
+        b.db.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO subscriptions VALUES('sub','222222222222222222','https://callback.example/events','unused',?,NULL,0)",
+                [now() + 3600],
+            )
+            .unwrap();
+        let t0 = Instant::now();
+        for i in 0..500_u64 {
+            let mut m = message();
+            let id = format!("{}", 100_000_000_000_000_000_u64 + i);
+            m["id"] = json!(id);
+            b.stage_raw(&m).unwrap();
+            b.finish_inbox_message(&id, "111111111111111111", "222222222222222222", &m)
+                .unwrap();
+        }
+        let ingest_us = t0.elapsed().as_secs_f64() * 1e6 / 500.0;
+
+        // 3. OAuth bearer verification & grant_active check
+        let (oauth, token, family) = oauth::OAuth::test_fixture();
+        let t0 = Instant::now();
+        for _ in 0..5_000 {
+            assert!(oauth.authorize_bearer(&token));
+            assert!(oauth.grant_active(&family));
+        }
+        let oauth_verify_us = t0.elapsed().as_secs_f64() * 1e6 / 5_000.0;
+
+        // 4. Typing prune & Outgoing prune (indexed zero-dirty-page path)
+        let prune_us = {
+            let db = b.db.lock().unwrap();
+            for i in 0..250_u64 {
+                let src = format!("{}", 200_000_000_000_000_000_u64 + i);
+                typing::finish(&db, &src).unwrap();
+            }
+            let t0 = Instant::now();
+            for _ in 0..5_000 {
+                typing::prune(&db).unwrap();
+                outgoing::prune(&db, now() - 7 * 86400).unwrap();
+            }
+            t0.elapsed().as_secs_f64() * 1e6 / 5_000.0
+        };
+
+        // 5. MCP status & diagnostics RPC dispatch
+        let t0 = Instant::now();
+        for _ in 0..1_000 {
+            let _ = b
+                .rpc(
+                    "tools/call",
+                    &json!({"name":"discord_bridge_status","arguments":{}}),
+                )
+                .await
+                .unwrap();
+            let _ = b
+                .rpc(
+                    "tools/call",
+                    &json!({"name":"discord_bridge_diagnostics","arguments":{}}),
+                )
+                .await
+                .unwrap();
+        }
+        let rpc_diag_us = t0.elapsed().as_secs_f64() * 1e6 / 1_000.0;
+
+        println!(
+            "BENCHMARK_RESULTS: split_short_us={split_short_us:.2} split_long_us={split_long_us:.2} ingest_with_context_us={ingest_us:.2} oauth_verify_us={oauth_verify_us:.2} prune_pair_us={prune_us:.2} status_plus_diag_rpc_us={rpc_diag_us:.2}"
         );
     }
 }

@@ -1,74 +1,147 @@
-# Discord DM → existing dot bridge (Rust, private prototype)
+# dot-discord-bridge
 
-**Owner-only, one-to-one Bot DMs. No server-channel monitoring.**
+Discord Bot の 1対1 DM（および任意で許可したサーバーチャンネル）を、署名付き **MCP Events** と **OAuth 2.1 (S256 PKCE)** で既存の AI エージェント（Dot / ChatGPT MCP クライアント）へ安全に接続する Rust 製軽量ブリッジです。
 
-Owner sends a DM to the Discord bot → Gateway `DIRECT_MESSAGES` → durable identifiers-only inbox → verify DM recipient and retrieve message using official Discord REST → SQLite outbox → signed MCP Events → existing dot → `discord_reply` to the same DM and source message.
+- **単一バイナリ・省リソース**: Rust + 同梱 SQLite (WAL) + Rustls で動作し、Raspberry Pi (ARM64) 本番環境でメモリ使用量 **約 9.6 MiB**・アイドル CPU **0.0%**。
+- **厳格な境界防御**: 送信者検証・DM 宛先検証・リクエスト単位の DNS ピニング（SSRF 防止）・送信前ジャーナルによる冪等保証・秘密情報を含まない閉じた診断カテゴリを備えています。
 
-No separate model, OpenAI API key, or Codex runtime is used. Rust 1.99+, a C compiler for bundled SQLite, one always-on process, persistent private disk, and public HTTPS are required. GitHub is optional for deployment.
+---
 
-## Security boundary
+## 機能・MCP ツール一覧
 
-- Set exactly one `DISCORD_OWNER_USER_ID`. Other authors, bot/webhook authors, guild messages, group DMs and unverified channels are rejected.
-- The bridge obtains `GET /api/v10/channels/{id}` using the Bot token and requires channel type `1`, no guild, and exactly one recipient matching the owner. Successful checks cache for five minutes, never across restart; queued deliveries and replies recheck when needed.
-- Gateway intent is only `DIRECT_MESSAGES (1 << 12)`. Bot DMs are exempt from the privileged Message Content requirement. No server message/privileged content intent is requested.
-- `discord.dm.created` subscriptions require the configured `owner_user_id`; a channel ID is not required or manually configured. The DM is learned from the owner's incoming message.
-- Replies are only to observed owner messages in that same verified DM. One source message gets one logical reply, split into Discord-sized parts if needed; bridge-owned replies can be edited via their source ID. There is no send-to-arbitrary-recipient tool, unsolicited DM creation, or Discord thread creation. Discord DMs are already the conversation; reply references preserve context.
-- Subscription automation must be created in the existing dot with a bounded response policy. Running this bridge alone does not generate replies.
+### イベント (`events/subscribe`)
 
-## Setup
+| イベント名 | 説明 |
+|---|---|
+| `discord.dm.created` | 許可ユーザーからの DM（または `DISCORD_GUILD_ENABLED=true` 時のサーバーメッセージ）を受信した際に署名付き Webhook で通知。直近会話コンテキスト・返信元・添付メタデータを含む。 |
 
-1. Choose an approved always-on host with persistent disk and outbound Discord WSS/HTTPS plus HTTPS callback access. Request-only serverless hosting is not assumed compatible.
-2. Create/use a Discord **bot**, not a user token/self-bot. The owner must be able to open a DM with it. If Discord requires shared-server presence for discoverability/access, arrange that separately; this bridge still never reads server channels. No Administrator or server-channel read permission is required by this DM design. Bot privacy/DM rules can still prevent delivery.
-3. Put `.env.example` values into the host's secure environment configuration. The application does not auto-load `.env`; do not source an untrusted file as shell code. Never paste live secrets into chat or include them in archives.
-4. Use a new private `discord-dm.sqlite3` database. This version rejects legacy channel-mode databases and rejects changing the owner of an existing DM database. Keep backups private/encrypted. Start with `umask 077` to protect SQLite files and sidecars.
-5. `cargo test --locked`, `cargo build --release --locked`, then run `./target/release/discord-dot-bridge`. It listens only on `127.0.0.1:8787`.
-6. Put an HTTPS reverse proxy in front of `/mcp` and the exact OAuth/discovery routes listed in [OAuth setup](OAUTH.md); preserve Host/Authorization, configure request/rate limits, disable credential/body logging. Set `MCP_ALLOWED_HOSTS` to the exact public Host value.
-7. Replace the placeholder endpoint in `plugin-template/mcp.json`, configure the predefined OAuth client in the private ChatGPT connection UI, follow [OAuth setup](OAUTH.md), and rescan. Verify `discord_reply` and `discord.dm.created` appear.
-8. Ask this existing dot to monitor DMs from the configured owner and define what it may answer. Confirm the actual callback hostname via trusted connection diagnostics, allow only that hostname in `CALLBACK_ALLOWED_HOSTS`, restart/retry subscription if needed. Do not guess callback hosts or broadly allow arbitrary domains.
-9. Send a harmless owner DM. Verify Gateway receipt → callback acknowledgment → existing dot execution → a single reply in the same DM. Test another author, group/guild message rejection, duplicates, unsubscribe, and restart.
+### ツール (`tools/call`)
 
-## Transport and delivery behavior
+| ツール名 | 用途 |
+|---|---|
+| `discord_reply` | 受信した `message_id` に対して返信（最大 32,000 UTF-16 単位。コードブロックを維持したまま 2,000 単位以下へ自動分割）。 |
+| `discord_edit_reply` | 送信済みの論理返信を元の `message_id` 指定で編集（分割パートの増減も自動調整）。 |
+| `discord_finish_response` | 返信不要（`no_response`）または生成失敗（`failed`）時にタイピング表示リースを即座に終了。 |
+| `discord_react` | 受信メッセージへのリアクション絵文字の追加（`add`）・削除（`remove`）。 |
+| `discord_send_file` | 受信メッセージへ Base64 ファイル（最大 20 MiB）を冪等キー付きで添付返信。 |
+| `discord_read_attachment` | 受信メッセージの添付ファイル（最大 20 MiB）を Discord 公式 CDN から検証・取得。 |
+| `discord_notify_owner` | オーナーの 1対1 DM へ能動通知を送信（`idempotency_key` による重複防止、`mention_owner` 対応）。 |
+| `discord_bridge_status` | 本文を含まない受信・送信キュー件数、通知先 DM 状態、直近のツールエラー概要を取得。 |
+| `discord_bridge_diagnostics` | 失敗した受信 lookup、保留中コールバック、不確定書き込み、直近 10 件のツール失敗分類（`tool` / `stage` / `reason` / `at`）を取得。 |
+| `discord_retry_failed_inbox` | 一時障害で `failed` になった受信メッセージの再取得を明示的に再試行。 |
 
-Streamable HTTP `initialize` protocol `2025-03-26`, OAuth access-token authentication by default (explicit legacy bearer mode for diagnostics), exact inbound Host allowlist, no browser Origin on `/mcp`, 256 KiB MCP body limit. Not MCP 2.0. Events use webhook only; no polling/streaming/replay.
+---
 
-Callback destinations use exact HTTPS hostname allowlists, connection-time public-IP validation/pinning, normal hostname TLS verification, no redirects/proxies, bounded requests. Standard Webhooks HMAC-SHA256, signed verification, deterministic subscription identities, five-minute verification cache and key-rotation overlap. Lifetime is capped at 24 hours and rounded up to one-second granularity.
+## クイックスタート（セットアップ手順）
 
-SQLite persists subscriptions, metadata-only inbox, verified messages, outbox and idempotency results. Owner ID is pinned to the database. Source and confirmed outgoing text retention is seven days; reply hashes, outgoing IDs, write journals and minimal result tombstones persist. Callback retries are bounded (eight attempts), stable IDs and possible duplicate attempts; delivery is not guaranteed and permanent/exhausted outbox failures are dropped. 410 deletes its subscription; 413 never retries. Event response bodies cannot override HTTP status. Production monitoring/dead-letter tooling is not included.
+### 1. 事前準備
 
-A source message with an uncertain write result is blocked from blind retry. Discord nonce provides only supplementary short-term deduplication. Gateway discovery and read lookups honor 429 delays. The bridge applies a conservative shared in-process REST cooldown after observed read/write 429 responses; this is not a full distributed bucket scheduler. Write errors, including 429, conservatively stop rather than blindly resending. Full route/global rate-limit scheduling is not included.
+1. **Discord Bot の作成**: Discord Developer Portal で Bot を作成し、Bot Token を取得します（オーナーが Bot と 1対1 DM を開ける状態にしてください）。
+2. **秘密鍵の生成**: OAuth クライアント用とオーナー同意画面用に、独立した 32 バイト以上のランダム文字列を 2 つ生成します。
+   ```sh
+   openssl rand -hex 32
+   openssl rand -hex 32
+   ```
 
-## Important limitations
+### 2. 環境変数ファイル (`deploy/.env`) の作成
 
-- Incoming owner message/channel IDs are committed before advancing the Gateway sequence. No message text is stored until the DM recipient is verified. Network/429/5xx lookup failures are retried with bounded backoff (up to eight attempts); permanent denial/missing/wrong-recipient records become `rejected`, and exhausted retries remain `failed`, never silently deleted. `discord_bridge_status` exposes content-free counts. Pending/failed records survive restarts; completed/rejected metadata is retained seven days. Failed rows require operator inspection/recovery, not blind duplicate sends.
-- Active subscriptions are selected when the verified message is hydrated, not when its ID was staged. If a subscription expired or was stopped during retries, no delivery is queued for it. A newly active matching subscription can receive a still-pending earlier message.
-- After recipient verification the message body is retrieved from Discord. It reflects the message at lookup time, not necessarily the original pre-edit event text; the occurrence timestamp remains Discord’s original message timestamp. A deleted/inaccessible message cannot be recovered; its rejection is retained. Minimal owner-origin message/channel IDs can temporarily be stored for a group DM before it is identified/rejected, but its content is never stored or forwarded.
-- A SQLite staging failure prevents sequence advancement and triggers a reconnect/resume; a processing DB failure stops the worker/process rather than being treated as an authorization error. Disk exhaustion still requires repair. A process crash before an event is durably staged, or loss of the resumable Gateway session, can still lose an event.
-- Gateway resume state is in-memory. Process restarts/expired sessions can miss messages; no historical replay. This is not a guaranteed-delivery messaging service.
-- Existing queued events whose channel verification temporarily fails use the bounded event retry policy. No data goes to the callback before verification succeeds.
-- Attachment metadata is signaled after DM verification, but attachment bytes and URLs are not retrieved or provided; see [feature details](FEATURES.md). No voice, slash commands, incoming-message edits, history backfill, group DMs, server channels, sharding, unauthorized proactive notices, or creation of new or arbitrary DM destinations. Explicitly authorized notices can be sent to the configured owner’s previously observed and freshly verified one-to-one DM.
-- Rotating/removing MCP credentials does not cancel existing subscriptions. Emergency revocation: stop the process and remove subscriptions before restarting with changed credentials.
-- Private plugin registration, real callback verification, real Discord DMs, and this dot's live reply remain unverified until approved hosting and credentials are provided.
+`.env.example` を `deploy/.env` にコピーし、権限を `600` に設定して値を記入します。
 
-## Validation and files
+```sh
+cp .env.example deploy/.env
+chmod 600 deploy/.env
+```
 
-See VALIDATION.md for executed tests. `src/main.rs`: MCP/persistence/DM authorization/replies; `src/gateway.rs`: DM receiver; `src/webhook.rs`: signed secure callbacks. `plugin-template/` is not an installed plugin. `.env.example` contains placeholders only.
+主な必須設定：
 
-Official references:
-- https://docs.discord.com/developers/events/gateway#message-content-intent
-- https://docs.discord.com/developers/resources/channel#get-channel
-- https://docs.discord.com/developers/resources/message#create-message
-- https://docs.discord.com/developers/topics/rate-limits
-- https://developers.openai.com/plugins/build/mcp-events
+| 変数名 | 内容 |
+|---|---|
+| `DISCORD_BOT_TOKEN` | Discord Bot トークン |
+| `DISCORD_OWNER_USER_ID` | オーナーの Discord ユーザー ID（17〜20桁の数値 1件） |
+| `OAUTH_ISSUER` | ブリッジの公開 HTTPS ベース URL（例: `https://discord-mcp.example.com`） |
+| `OAUTH_CLIENT_ID` | 任意のクライアント識別子（例: `discord-dot-owner`） |
+| `OAUTH_CLIENT_SECRET` | クライアント秘密鍵（32文字以上） |
+| `OAUTH_OWNER_APPROVAL_SECRET` | ブラウザ同意画面に入力するオーナー承認鍵（32文字以上・上記と別値） |
+| `OAUTH_REDIRECT_URIS` | クライアント画面に表示される正確な Redirect URI |
+| `MCP_ALLOWED_HOSTS` | ブリッジの公開ホスト名（例: `discord-mcp.example.com`） |
+| `CALLBACK_ALLOWED_HOSTS` | MCP Events 配信先として許可するコールバックホスト名 |
 
-## Discord client features (v0.4.0)
+オプション設定：
 
-See [feature behavior and limits](FEATURES.md): bounded typing, multipart replies, source-bound edits, reply references, and configurable recent owner-DM context. All existing OAuth/recipient/SSRF/callback controls remain in place.
+| 変数名 | デフォルト | 内容 |
+|---|---|---|
+| `DISCORD_GUILD_ENABLED` | `false` | `true` にするとサーバーチャンネルでの受信・返信を許可（Bot に Message Content Intent が必要） |
+| `DISCORD_RESPONDERS_FILE` | 未設定 | 追加で反応を許可するユーザー ID リスト JSON（`deploy/responders.example.json` 参照。再起動なしで即時反映） |
+| `TYPING_TIMEOUT_SECS` | `120` | タイピング表示の最大維持秒数（0〜300） |
+| `RECENT_CONTEXT_LIMIT` | `10` | イベントに含める同一 DM 直近メッセージ数（0〜20） |
 
-## Proactive owner notifications
+### 3. コンテナまたはバイナリの起動
 
-The `discord_notify_owner` MCP tool sends an authorized standalone update only to the configured owner's previously observed and verified DM. Important updates/decisions can explicitly mention only that owner. Stable idempotency keys and a durable pre-send journal prevent blind retries after uncertain writes. See [NOTIFICATIONS.md](NOTIFICATIONS.md) for required parameters, limits and recovery boundaries. No scheduler, new recipient, deployment or configuration change is introduced.
+**Docker Compose（推奨）**:
 
-### Recovery tools
+```sh
+cd deploy
+docker compose up -d --build
+docker compose exec discord-dm /usr/local/bin/discord-dot-bridge --healthcheck
+```
 
+**ソースから直接ビルド・起動する場合**:
 
-`discord_bridge_diagnostics` lists bounded, content-free failed inbox, pending callback and uncertain outgoing metadata. `discord_retry_failed_inbox` is a narrowly scoped, explicit-owner-request retry of a recent failed inbox lookup, not a retry of an uncertain Discord write. Terminal callback failures are not retained. See [recovery behavior and limits](FEATURES.md#recovery-diagnostics-and-failed-inbox-retry).
+```sh
+cargo test --locked
+cargo build --release --locked
+umask 077
+./target/release/discord-dot-bridge
+```
+
+### 4. HTTPS リバースプロキシの公開パス
+
+ブリッジは `127.0.0.1:8787` のみで待ち受けます。Cloudflare Tunnel や Nginx 等の HTTPS リバースプロキシから、`Host` と `Authorization` ヘッダを保持して以下のパスのみを転送してください（`/healthz` は外部公開しないでください）：
+
+- `/mcp`
+- `/.well-known/oauth-authorization-server`
+- `/.well-known/oauth-protected-resource`
+- `/.well-known/oauth-protected-resource/mcp`
+- `/oauth/authorize`
+- `/oauth/token`
+- `/oauth/revoke`
+
+### 5. クライアント接続と動作確認
+
+1. `plugin-template/mcp.json` の URL を公開ホスト名に合わせてクライアントへ登録し、`OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` を入力します。
+2. ブラウザ同意画面で `OAUTH_OWNER_APPROVAL_SECRET` を入力して承認します。
+3. エージェント側で `discord.dm.created` を購読し、Bot へ DM を送信して返信・通知（`discord_notify_owner`）が動作することを確認します。
+
+---
+
+## 運用・トラブルシューティング
+
+問題が発生した際は、`discord_bridge_status` または `discord_bridge_diagnostics` を呼び出すことで、秘密情報や会話本文を一切露出せずに原因を特定できます。
+
+- `notification_destination_status`:
+  - `ready`: オーナーの 1対1 DM チャンネルが 1 件に確定しており、`discord_notify_owner` が送信可能。
+  - `missing_owner_dm`: まだオーナーからの DM が観測されていない（先にオーナーから Bot へ 1 通 DM を送ると解決）。
+  - `ambiguous_multiple_dm_channels`: 複数の DM チャンネル候補が存在し安全のため停止中。
+- `last_tool_failure` / `recent_tool_failures`:
+  - 直近のツールエラーが発生段階（`stage`: `validation`, `destination`, `idempotency`, `discord_lookup`, `transport_or_confirm` 等）と理由（`reason`: `invalid_idempotency_key`, `missing_owner_dm_destination`, `key_or_pending_conflict`, `discord_rate_limited` 等）で即座に判別できます。
+
+---
+
+## ベンチマーク (v0.5.0)
+
+`cargo test --release --locked -- --nocapture benchmark_core_paths` による実測値および Raspberry Pi (ARM64) 本番稼働時のリソース指標：
+
+| 計測項目 | レイテンシ (1回あたり) | スループット |
+|---|---|---|
+| 短文メッセージ分割 (`splitter::split`, 1パート) | **0.79 µs** | ~1,265,000 ops/s |
+| 長文 Markdown + コードフェンス分割 (15,000文字 → 8パート) | **190.21 µs** | ~5,250 ops/s |
+| メッセージ受信 + 文脈構築 (`stage_raw` + 500件履歴検索 + outbox) | **138.66 µs** | ~7,210 msgs/s |
+| OAuth 2.1 Bearer 検証 + Grant Family 有効性確認 | **11.33 µs** | ~88,200 checks/s |
+| 定期 Prune (`typing::prune` + `outgoing::prune`, 250件リース) | **6.18 µs** | ~161,800 ops/s |
+| 診断 RPC 往復 (`discord_bridge_status` + `discord_bridge_diagnostics`) | **232.77 µs** | ~4,295 pairs/s |
+
+| リソース指標 (Raspberry Pi ARM64 本番コンテナ `deploy-discord-dm-1`) | 実測値 |
+|---|---|
+| リリースバイナリサイズ (`discord-dot-bridge`) | **9.2 MiB** |
+| 常駐メモリ使用量 (RSS) | **9.6 MiB** (`9,840 KB`) |
+| アイドル時 CPU 使用率 | **0.0% 〜 0.05%** |

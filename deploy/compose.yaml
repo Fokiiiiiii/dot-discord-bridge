@@ -1,11 +1,10 @@
 services:
   discord-dm:
+    image: ghcr.io/fokiiiiiii/dot-discord-bridge:0.5.0
     build:
       context: ..
       dockerfile: Dockerfile
-    image: discord-dot-bridge:0.4.0
-    platform: linux/arm64
-    # Linux host mode preserves the service's loopback-only binding. No published ports.
+    # Host networking preserves loopback-only binding on 127.0.0.1:8787
     network_mode: host
     env_file:
       - .env
@@ -29,5 +28,6 @@ services:
       options:
         max-size: "5m"
         max-file: "3"
+
 volumes:
   dm-data:

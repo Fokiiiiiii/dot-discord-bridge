@@ -12,11 +12,9 @@ use std::{
 use tokio::time::{self, Instant, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-// DM-only: DIRECT_MESSAGES supplies MESSAGE_CREATE. Content in DMs with the
-// app is exempt from the privileged MESSAGE_CONTENT intent; do not request guild
-// events or privileged content access. Owner/channel authorization remains the
-// persistence layer's responsibility; Gateway intents alone are not an ACL.
-// https://docs.discord.com/developers/events/gateway#message-content-intent
+// Default intent is DIRECT_MESSAGES (1 << 12); when DISCORD_GUILD_ENABLED=true,
+// GUILD_MESSAGES (1 << 9) | MESSAGE_CONTENT (1 << 15) are added at Identify time.
+// Owner/responder and channel authorization are enforced in the persistence layer.
 const INTENTS: u64 = 1 << 12;
 
 #[derive(Default)]
@@ -229,7 +227,7 @@ pub async fn run(
     presence: Arc<PresenceSource>,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
-        .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
+        .user_agent(crate::USER_AGENT)
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()

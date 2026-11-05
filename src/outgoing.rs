@@ -679,7 +679,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let response = reqwest::Client::builder()
-            .user_agent("DiscordBot (https://github.com/Fokiiiiiii/dot-discord-bridge, 0.4.0)")
+            .user_agent(crate::USER_AGENT)
             .no_proxy()
             .build()
             .unwrap()

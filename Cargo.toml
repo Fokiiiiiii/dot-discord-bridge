@@ -1,8 +1,11 @@
 [package]
 name = "discord-dot-bridge"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.99"
+description = "Owner-only Discord Bot DM & Guild bridge for MCP Events and OAuth 2.1"
+license = "MIT"
+repository = "https://github.com/Fokiiiiiii/dot-discord-bridge"
 
 [dependencies]
 anyhow = "1"

@@ -139,8 +139,10 @@ pub fn split(text: &str) -> Result<Vec<String>> {
         units += c.len_utf16();
         boundaries.push((at + c.len_utf8(), units));
     }
+    let non_ws_end = text.trim_end().len();
     let mut output = Vec::new();
     let mut start_index = 0;
+    let mut candidates = Vec::new();
     while start_index + 1 < boundaries.len() {
         if output.len() >= MAX_PARTS {
             bail!("Logical reply requires more than 32 parts");
@@ -148,7 +150,7 @@ pub fn split(text: &str) -> Result<Vec<String>> {
         let (start, start_units) = boundaries[start_index];
         let prefix = layout.state(start).map(Fence::reopen).unwrap_or_default();
         let prefix_units = discord_len(&prefix);
-        let mut candidates = Vec::new();
+        candidates.clear();
         for (index, &(end, end_units)) in boundaries.iter().enumerate().skip(start_index + 1) {
             let used = prefix_units + end_units - start_units;
             if used > MAX_MESSAGE {
@@ -159,12 +161,12 @@ pub fn split(text: &str) -> Result<Vec<String>> {
             }
             // Keep a real character in a short trailing whitespace-only remainder.
             // Discord rejects whitespace-only messages; never silently trim it.
-            if end < text.len() && layout.state(end).is_none() && text[end..].trim().is_empty() {
+            if end < text.len() && end >= non_ws_end && layout.state(end).is_none() {
                 continue;
             }
-            let closing = layout.state(end).map(Fence::close).unwrap_or_default();
-            if used + discord_len(&closing) <= MAX_MESSAGE {
-                candidates.push((index, end, end_units, closing));
+            let closing_units = layout.state(end).map(|f| 1 + f.count).unwrap_or(0);
+            if used + closing_units <= MAX_MESSAGE {
+                candidates.push((index, end, end_units));
             }
         }
         let Some(last) = candidates.last() else {
@@ -182,14 +184,15 @@ pub fn split(text: &str) -> Result<Vec<String>> {
                 .map(|(i, _)| i)
                 .unwrap()
         };
-        let (index, end, _, closing) = &candidates[chosen];
-        let part = format!("{prefix}{}{closing}", &text[start..*end]);
+        let (index, end, _) = candidates[chosen];
+        let closing = layout.state(end).map(Fence::close).unwrap_or_default();
+        let part = format!("{prefix}{}{closing}", &text[start..end]);
         if part.trim().is_empty() {
             bail!("Splitting would produce an empty Discord message");
         }
         debug_assert!(discord_len(&part) <= MAX_MESSAGE);
         output.push(part);
-        start_index = *index;
+        start_index = index;
     }
     Ok(output)
 }

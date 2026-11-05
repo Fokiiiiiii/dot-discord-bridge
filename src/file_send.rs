@@ -33,7 +33,7 @@ fn prepare(p: &Value) -> Result<(String, String, String, Vec<u8>)> {
         || name
             .chars()
             .any(|c| c.is_control() || matches!(c, '/' | '\\' | '"'))
-        || data.len() > ((LIMIT + 2) / 3) * 4
+        || data.len() > LIMIT.div_ceil(3) * 4
     {
         bail!("Invalid upload parameters");
     }
