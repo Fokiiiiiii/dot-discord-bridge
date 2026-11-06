@@ -308,6 +308,8 @@ impl Bridge {
         )?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS tool_failures(id INTEGER PRIMARY KEY AUTOINCREMENT,at INTEGER NOT NULL,tool TEXT NOT NULL,stage TEXT NOT NULL,reason TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_inbox_status_due_received ON inbox(status, due, received);
+        CREATE INDEX IF NOT EXISTS idx_inbox_status_received_id ON inbox(status, received, id);
+        CREATE INDEX IF NOT EXISTS idx_subscriptions_owner_expires ON subscriptions(owner, expires);
         CREATE INDEX IF NOT EXISTS idx_queue_due ON queue(due);
         CREATE INDEX IF NOT EXISTS idx_messages_author_channel_received ON messages(author, channel, received);
         CREATE INDEX IF NOT EXISTS idx_messages_owner_dm_channel ON messages(author, channel) WHERE COALESCE(json_extract(body, '$.is_guild'), 0)=0;
@@ -1535,7 +1537,12 @@ fn classify_tool_error(tool: &str, err: &anyhow::Error) -> (&'static str, &'stat
     if msg == "Notification key conflicts with prior request" {
         return ("pre_send_rejected", "key_conflict");
     }
-    if msg == "Notification outcome uncertain; operator inspection required; do not use a new key" {
+    if msg == "Notification outcome uncertain; operator inspection required; do not use a new key"
+        || msg
+            == "Previous multipart operation incomplete or uncertain; operator inspection required"
+        || msg == "Previous send uncertain; operator inspection required"
+        || msg == "Original reply uncertain; operator inspection required"
+    {
         return ("delivery_uncertain", "prior_outcome_uncertain");
     }
     if msg.starts_with("No previously observed owner DM") {

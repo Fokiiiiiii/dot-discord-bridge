@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub fn init(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS notifications(key_hash TEXT PRIMARY KEY,owner TEXT NOT NULL,content_hash TEXT NOT NULL,channel TEXT NOT NULL,state TEXT NOT NULL,result TEXT,created INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS notification_destinations(owner TEXT NOT NULL,channel TEXT NOT NULL,PRIMARY KEY(owner,channel));")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS notifications(key_hash TEXT PRIMARY KEY,owner TEXT NOT NULL,content_hash TEXT NOT NULL,channel TEXT NOT NULL,state TEXT NOT NULL,result TEXT,created INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS notification_destinations(owner TEXT NOT NULL,channel TEXT NOT NULL,PRIMARY KEY(owner,channel)); CREATE INDEX IF NOT EXISTS idx_notifications_state_created ON notifications(state, created DESC);")?;
     Ok(())
 }
 /// Call only after validating this channel as the configured owner's one-to-one DM.

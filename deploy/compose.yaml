@@ -1,6 +1,6 @@
 services:
   discord-dm:
-    image: ghcr.io/fokiiiiiii/dot-discord-bridge:0.5.2
+    image: ghcr.io/fokiiiiiii/dot-discord-bridge:0.5.3
     build:
       context: ..
       dockerfile: Dockerfile

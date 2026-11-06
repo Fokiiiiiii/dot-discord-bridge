@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 const LIMIT: usize = 20 * 1024 * 1024;
 pub fn init(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS file_sends (key_hash TEXT PRIMARY KEY, source TEXT NOT NULL, content_hash TEXT NOT NULL, state TEXT NOT NULL, result TEXT)")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS file_sends (key_hash TEXT PRIMARY KEY, source TEXT NOT NULL, content_hash TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE INDEX IF NOT EXISTS idx_file_sends_state_source ON file_sends(state, source);")?;
     Ok(())
 }
 fn digest(data: &[u8]) -> String {

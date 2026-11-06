@@ -3,7 +3,7 @@ use crate::{now, params, Bridge, Connection, OptionalExtension, Result};
 use serde_json::Value;
 
 pub fn init(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS typing_leases(source TEXT PRIMARY KEY,channel TEXT NOT NULL,sid TEXT NOT NULL,expires INTEGER NOT NULL,state TEXT NOT NULL,created INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS typing_channels(channel TEXT PRIMARY KEY,next_due INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_typing_leases_state_expires ON typing_leases(state, expires); CREATE INDEX IF NOT EXISTS idx_typing_leases_created ON typing_leases(created);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS typing_leases(source TEXT PRIMARY KEY,channel TEXT NOT NULL,sid TEXT NOT NULL,expires INTEGER NOT NULL,state TEXT NOT NULL,created INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS typing_channels(channel TEXT PRIMARY KEY,next_due INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_typing_leases_state_expires ON typing_leases(state, expires); CREATE INDEX IF NOT EXISTS idx_typing_leases_created ON typing_leases(created); CREATE INDEX IF NOT EXISTS idx_typing_leases_sid_active ON typing_leases(sid) WHERE state='active';")?;
     // Never resume cosmetic typing after process restart.
     db.execute(
         "UPDATE typing_leases SET state='stopped' WHERE state='active'",
@@ -42,7 +42,7 @@ pub fn finish(db: &Connection, source: &str) -> Result<()> {
 }
 pub fn stop_subscription(db: &Connection, sid: &str) -> Result<()> {
     db.execute(
-        "UPDATE typing_leases SET state='stopped' WHERE sid=?",
+        "UPDATE typing_leases SET state='stopped' WHERE sid=? AND state='active'",
         [sid],
     )?;
     Ok(())

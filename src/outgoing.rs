@@ -6,12 +6,16 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub fn init(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS outgoing_parts(source TEXT NOT NULL,part INTEGER NOT NULL,message_id TEXT NOT NULL,content TEXT,updated INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(source,part)); CREATE TABLE IF NOT EXISTS outgoing_jobs(source TEXT PRIMARY KEY,kind TEXT NOT NULL,content_hash TEXT NOT NULL,state TEXT NOT NULL,result TEXT); CREATE TABLE IF NOT EXISTS outgoing_writes(id TEXT PRIMARY KEY,source TEXT NOT NULL,part INTEGER NOT NULL,kind TEXT NOT NULL,target TEXT,content_hash TEXT,state TEXT NOT NULL,created INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_outgoing_parts_updated_notnull ON outgoing_parts(updated) WHERE content IS NOT NULL; CREATE INDEX IF NOT EXISTS idx_outgoing_parts_message_id ON outgoing_parts(message_id) WHERE active=1 AND content IS NOT NULL; CREATE INDEX IF NOT EXISTS idx_outgoing_parts_source_active ON outgoing_parts(source, active) WHERE content IS NOT NULL; CREATE INDEX IF NOT EXISTS idx_outgoing_jobs_state ON outgoing_jobs(state); CREATE INDEX IF NOT EXISTS idx_outgoing_writes_state ON outgoing_writes(state);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS outgoing_parts(source TEXT NOT NULL,part INTEGER NOT NULL,message_id TEXT NOT NULL,content TEXT,updated INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(source,part)); CREATE TABLE IF NOT EXISTS outgoing_jobs(source TEXT PRIMARY KEY,kind TEXT NOT NULL,content_hash TEXT NOT NULL,state TEXT NOT NULL,result TEXT); CREATE TABLE IF NOT EXISTS outgoing_writes(id TEXT PRIMARY KEY,source TEXT NOT NULL,part INTEGER NOT NULL,kind TEXT NOT NULL,target TEXT,content_hash TEXT,state TEXT NOT NULL,created INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_outgoing_parts_updated_notnull ON outgoing_parts(updated) WHERE content IS NOT NULL; CREATE INDEX IF NOT EXISTS idx_outgoing_parts_message_id ON outgoing_parts(message_id) WHERE active=1 AND content IS NOT NULL; CREATE INDEX IF NOT EXISTS idx_outgoing_parts_source_active ON outgoing_parts(source, active) WHERE content IS NOT NULL; CREATE INDEX IF NOT EXISTS idx_outgoing_jobs_state ON outgoing_jobs(state); CREATE INDEX IF NOT EXISTS idx_outgoing_writes_state_created ON outgoing_writes(state, created);")?;
     Ok(())
 }
 pub fn prune(db: &Connection, cutoff: i64) -> Result<()> {
     db.execute(
         "UPDATE outgoing_parts SET content=NULL WHERE content IS NOT NULL AND updated<?",
+        [cutoff],
+    )?;
+    db.execute(
+        "DELETE FROM outgoing_writes WHERE state='confirmed' AND created<?",
         [cutoff],
     )?;
     Ok(())
@@ -778,5 +782,14 @@ mod tests {
             .unwrap();
         assert!(content.is_none());
         assert!(snowflake(&id));
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM outgoing_writes WHERE state='confirmed'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 }

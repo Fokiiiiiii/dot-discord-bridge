@@ -1,6 +1,6 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "discord-dot-bridge",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Owner-only Discord bot DMs and optional guild channels through MCP Events."
 }

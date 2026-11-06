@@ -65,7 +65,11 @@ jobs:
 
       - name: Package distribution archive
         run: |
-          VERSION="${GITHUB_REF_NAME:-v0.5.0}"
+          if [[ "${GITHUB_REF_NAME:-}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          fi
           STAGE="${BINARY_NAME}-${VERSION}-${{ matrix.target }}"
           mkdir -p "${STAGE}"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${STAGE}/"
