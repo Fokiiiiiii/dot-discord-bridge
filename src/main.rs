@@ -122,14 +122,12 @@ fn verify_subscription_response(
     } else {
         SubscribeDiagnostic::VerificationStatus
     };
+    let echoed_challenge = echoed["challenge"].as_str().unwrap_or("");
+    let expected_hash = Sha256::digest(challenge.as_bytes());
+    let actual_hash = Sha256::digest(echoed_challenge.as_bytes());
     if !(200..300).contains(&status)
-        || !bool::from(
-            echoed["challenge"]
-                .as_str()
-                .unwrap_or("")
-                .as_bytes()
-                .ct_eq(challenge.as_bytes()),
-        )
+        || !echoed["challenge"].is_string()
+        || !bool::from(actual_hash.as_slice().ct_eq(expected_hash.as_slice()))
     {
         bail!("callback_verification_failed")
     }
@@ -143,8 +141,8 @@ fn now() -> i64 {
 }
 fn iso(t: i64) -> String {
     chrono::DateTime::from_timestamp(t, 0)
-        .unwrap()
-        .to_rfc3339_opts(SecondsFormat::Secs, true)
+        .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_default()
 }
 fn snowflake(s: &str) -> bool {
     (15..=22).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
@@ -828,6 +826,7 @@ impl Bridge {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         tx.execute("DELETE FROM subscriptions WHERE id=?", [&id])?;
+        tx.execute("DELETE FROM subscription_grants WHERE sid=?", [&id])?;
         tx.execute("DELETE FROM queue WHERE sid=?", [&id])?;
         typing::stop_subscription(&tx, &id)?;
         tx.commit()?;
@@ -1060,6 +1059,7 @@ impl Bridge {
                 db.execute("DELETE FROM queue WHERE sid=? AND eid=?", params![sid, eid])?;
                 if status == 410 {
                     db.execute("DELETE FROM subscriptions WHERE id=?", [&sid])?;
+                    db.execute("DELETE FROM subscription_grants WHERE sid=?", [&sid])?;
                 }
                 if !(200..300).contains(&status) {
                     if status == 410 {
@@ -1496,14 +1496,24 @@ fn classify_tool_error(tool: &str, err: &anyhow::Error) -> (&'static str, &'stat
         || msg == "Notification text is empty"
         || msg == "Invalid reply"
         || msg == "Empty reply"
+        || msg == "Reply must contain non-whitespace text"
+        || msg == "Invalid source message"
         || msg == "Invalid message"
         || msg == "Invalid message ID"
         || msg == "Invalid completion"
         || msg == "Invalid reaction"
         || msg == "Invalid upload parameters"
         || msg == "Invalid attachment index"
+        || msg == "Code fence delimiter/info exceeds 256 UTF-16 units"
+        || msg == "Code fence delimiter exceeds Discord message limit"
     {
         return ("pre_send_rejected", "invalid_arguments");
+    }
+    if msg == "Different reply already exists; use discord_edit_reply" {
+        return ("pre_send_rejected", "reply_already_exists");
+    }
+    if msg == "No bridge-owned reply for source" {
+        return ("pre_send_rejected", "no_owned_reply");
     }
     if msg == "Invalid notification idempotency key" {
         return ("pre_send_rejected", "invalid_idempotency_key");
@@ -1511,7 +1521,10 @@ fn classify_tool_error(tool: &str, err: &anyhow::Error) -> (&'static str, &'stat
     if msg == "Owner mention requires important notification" {
         return ("pre_send_rejected", "owner_mention_requires_important");
     }
-    if msg == "Notification exceeds 2000 UTF-16 units including mention" {
+    if msg == "Notification exceeds 2000 UTF-16 units including mention"
+        || msg == "Logical reply exceeds 32000 UTF-16 units"
+        || msg == "Logical reply requires more than 32 parts"
+    {
         return ("pre_send_rejected", "text_too_long");
     }
     if msg == "Exactly one notification owner required"
@@ -1653,12 +1666,14 @@ async fn handle(
     });
     let authorized = if b.config.oauth.is_some() {
         family.is_some()
+    } else if !b.config.bearer.is_empty() {
+        auth.strip_prefix("Bearer ").is_some_and(|token| {
+            let actual = Sha256::digest(token.as_bytes());
+            let expected = Sha256::digest(b.config.bearer.as_bytes());
+            bool::from(actual.as_slice().ct_eq(expected.as_slice()))
+        })
     } else {
-        !b.config.bearer.is_empty()
-            && bool::from(
-                auth.as_bytes()
-                    .ct_eq(format!("Bearer {}", b.config.bearer).as_bytes()),
-            )
+        false
     };
     if !authorized {
         return if let Some(oauth) = &b.config.oauth {
@@ -1845,6 +1860,10 @@ async fn main() -> Result<()> {
                     [cutoff],
                 );
                 let _ = db.execute("DELETE FROM subscriptions WHERE expires<?", [now()]);
+                let _ = db.execute(
+                    "DELETE FROM subscription_grants WHERE NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.id=subscription_grants.sid)",
+                    [],
+                );
             }
             ticks = ticks.wrapping_add(1);
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -3800,6 +3819,59 @@ mod dm_tests {
                 .unwrap(),
             0
         );
+    }
+    #[tokio::test]
+    async fn pre_send_validation_errors_never_misclassify_as_delivery_uncertain() {
+        let b = Bridge::new(":memory:", cfg()).unwrap();
+        b.accept_dm_descriptor("111111111111111111", &descriptor())
+            .unwrap();
+        let m = message();
+        b.ingest(&m).unwrap();
+
+        for (tool, args, expected_reason) in [
+            (
+                "discord_reply",
+                json!({"message_id":"333333333333333333","text":"   \n\t  "}),
+                "invalid_arguments",
+            ),
+            (
+                "discord_reply",
+                json!({"message_id":"bad","text":"hello"}),
+                "invalid_arguments",
+            ),
+            (
+                "discord_edit_reply",
+                json!({"message_id":"333333333333333333","text":"edited"}),
+                "no_owned_reply",
+            ),
+            (
+                "discord_send_file",
+                json!({"message_id":"888888888888888888","idempotency_key":"k1","filename":"a.txt","data_base64":"aGk="}),
+                "source_not_observed",
+            ),
+            (
+                "discord_send_file",
+                json!({"message_id":"333333333333333333","idempotency_key":"k1","filename":"a.txt","data_base64":"!!!not_base64!!!"}),
+                "invalid_arguments",
+            ),
+            (
+                "discord_react",
+                json!({"message_id":"888888888888888888","emoji":"👍","action":"add"}),
+                "source_not_observed",
+            ),
+        ] {
+            let res = b
+                .rpc("tools/call", &json!({"name":tool,"arguments":args}))
+                .await
+                .unwrap();
+            assert_eq!(res["isError"], true);
+            let text = res["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains(&format!("stage=pre_send_rejected reason={expected_reason}")),
+                "unexpected error text for {tool}: {text}"
+            );
+            assert!(!text.contains("delivery_uncertain"));
+        }
     }
     #[tokio::test]
     async fn shared_cooldown_defers_multiple_items_without_network() {

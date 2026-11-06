@@ -33,9 +33,13 @@ pub fn diagnostics(b: &Bridge, args: &Value) -> Result<Value> {
     let mut rows = stmt.query([])?;
     let mut inbox = Vec::new();
     let mut inbox_truncated = false;
+    let mut author_cache = std::collections::HashMap::<String, bool>::new();
     while let Some(r) = rows.next()? {
         let author: String = r.get(1)?;
-        if !b.can_respond(&author) {
+        let allowed = *author_cache
+            .entry(author.clone())
+            .or_insert_with(|| b.can_respond(&author));
+        if !allowed {
             continue;
         }
         if inbox.len() == LIMIT {

@@ -37,7 +37,10 @@ fn prepare(p: &Value) -> Result<(String, String, String, Vec<u8>)> {
     {
         bail!("Invalid upload parameters");
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()
+        .context("Invalid upload parameters")?;
     if bytes.len() >= LIMIT {
         bail!("Invalid upload size");
     }
@@ -46,11 +49,15 @@ fn prepare(p: &Value) -> Result<(String, String, String, Vec<u8>)> {
 pub async fn send(b: &Bridge, p: &Value) -> Result<Value> {
     let (source, key, name, data) = prepare(p)?;
     let _lock = b.reply_lock.lock().await;
-    let (channel, author): (String, String) = b.db.lock().unwrap().query_row(
-        "SELECT channel,author FROM messages WHERE id=?",
-        [&source],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (channel, author): (String, String) =
+        b.db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT channel,author FROM messages WHERE id=?",
+                [&source],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .context("Source not observed")?;
     if !b.can_respond(&author) {
         bail!("Unauthorized source");
     }
@@ -104,15 +111,29 @@ pub async fn send(b: &Bridge, p: &Value) -> Result<Value> {
         .send()
         .await?;
     if res.status().as_u16() == 429 {
+        let retry_header = res
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
+        b.set_rest_cooldown(crate::retry_delay(retry_header, None));
+        let mut bytes = Vec::new();
+        while let Ok(Some(chunk)) = res.chunk().await {
+            if bytes.len() + chunk.len() > 65536 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         b.set_rest_cooldown(crate::retry_delay(
-            res.headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok()),
-            None,
+            retry_header,
+            body["retry_after"].as_f64(),
         ));
+        crate::typing::finish(&b.db.lock().unwrap(), &source)?;
+        bail!("Upload unconfirmed; inspect Discord");
     }
     if res.status().as_u16() != 200 {
+        crate::typing::finish(&b.db.lock().unwrap(), &source)?;
         bail!("Upload unconfirmed; inspect Discord");
     }
     let mut buf = Vec::new();

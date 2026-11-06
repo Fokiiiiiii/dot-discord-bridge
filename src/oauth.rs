@@ -38,7 +38,9 @@ fn random() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 fn equal(a: &str, b: &str) -> bool {
-    bool::from(hash(a).as_bytes().ct_eq(hash(b).as_bytes()))
+    let ha = Sha256::digest(a.as_bytes());
+    let hb = Sha256::digest(b.as_bytes());
+    bool::from(ha.as_slice().ct_eq(hb.as_slice()))
 }
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -102,18 +104,29 @@ impl Config {
         format!("{}/mcp", self.issuer)
     }
     fn tag(&self) -> String {
-        hash(&format!(
-            "{}\0{}\0{}\0{}\0{}",
-            self.issuer,
-            self.client,
-            self.secret,
-            self.owner,
-            self.redirects.join("\0")
-        ))
+        let mut h = Sha256::new();
+        h.update(self.issuer.as_bytes());
+        h.update(b"\0");
+        h.update(self.client.as_bytes());
+        h.update(b"\0");
+        h.update(self.secret.as_bytes());
+        h.update(b"\0");
+        h.update(self.owner.as_bytes());
+        if self.redirects.is_empty() {
+            h.update(b"\0");
+        } else {
+            for r in &self.redirects {
+                h.update(b"\0");
+                h.update(r.as_bytes());
+            }
+        }
+        URL_SAFE_NO_PAD.encode(h.finalize())
     }
 }
 pub struct OAuth {
     config: Config,
+    resource: String,
+    authority: String,
     db: Mutex<Connection>,
     attempts: Mutex<VecDeque<i64>>,
 }
@@ -194,10 +207,18 @@ impl OAuth {
     }
     fn new(config: Config, db: Connection) -> Result<Self> {
         config.validate()?;
+        let u = Url::parse(&config.issuer)?;
+        let authority = match u.port() {
+            Some(p) => format!("{}:{}", u.host_str().unwrap_or(""), p),
+            None => u.host_str().unwrap_or("").to_owned(),
+        };
+        let resource = config.resource();
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS oauth_pending(id TEXT PRIMARY KEY,cookie TEXT NOT NULL,request TEXT NOT NULL,expires INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS oauth_codes(code TEXT PRIMARY KEY,request TEXT NOT NULL,tag TEXT NOT NULL,expires INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS oauth_tokens(token TEXT PRIMARY KEY,kind TEXT NOT NULL,family TEXT NOT NULL,tag TEXT NOT NULL,expires INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS oauth_revoked(family TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS oauth_used_codes(code TEXT PRIMARY KEY,tag TEXT NOT NULL,family TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_oauth_tokens_family_tag_expires ON oauth_tokens(family, tag, expires); CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expires ON oauth_tokens(expires); CREATE INDEX IF NOT EXISTS idx_oauth_codes_expires ON oauth_codes(expires); CREATE INDEX IF NOT EXISTS idx_oauth_pending_expires ON oauth_pending(expires);")?;
         Ok(Self {
             config,
+            resource,
+            authority,
             db: Mutex::new(db),
             attempts: Mutex::new(VecDeque::new()),
         })
@@ -238,16 +259,9 @@ impl OAuth {
         db.query_row("SELECT EXISTS(SELECT 1 FROM oauth_tokens t WHERE family=?1 AND tag=?2 AND expires>?3 AND (kind='access' OR (kind='refresh' AND used=0)) AND NOT EXISTS(SELECT 1 FROM oauth_revoked r WHERE r.family=t.family))",params![family,self.config.tag(),now()],|r|r.get::<_,bool>(0)).unwrap_or(false)
     }
     fn good_host(&self, h: &HeaderMap) -> bool {
-        let Ok(u) = Url::parse(&self.config.issuer) else {
-            return false;
-        };
-        let authority = match u.port() {
-            Some(p) => format!("{}:{}", u.host_str().unwrap_or(""), p),
-            None => u.host_str().unwrap_or("").to_owned(),
-        };
         h.get(header::HOST)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == authority)
+            .is_some_and(|v| v == self.authority)
     }
     fn validate_request(&self, a: &Authorization) -> bool {
         a.response_type == "code"
@@ -259,7 +273,7 @@ impl OAuth {
             && URL_SAFE_NO_PAD
                 .decode(&a.code_challenge)
                 .is_ok_and(|v| v.len() == 32)
-            && a.resource == self.config.resource()
+            && a.resource == self.resource
             && a.scope == SCOPE
     }
     fn authenticate(&self, h: &HeaderMap, f: &TokenForm) -> bool {
@@ -317,7 +331,7 @@ impl OAuth {
         )
     }
     fn exchange(&self, f: &TokenForm) -> Result<serde_json::Value> {
-        if f.resource.as_deref() != Some(self.config.resource().as_str()) {
+        if f.resource.as_deref() != Some(self.resource.as_str()) {
             bail!("invalid_target");
         }
         let mut db = self
@@ -450,7 +464,7 @@ async fn resource_metadata(State(s): State<Arc<OAuth>>, h: HeaderMap) -> Respons
     if !s.good_host(&h) {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
     }
-    secure(Json(json!({"resource":s.config.resource(),"authorization_servers":[s.config.issuer],"scopes_supported":[SCOPE],"bearer_methods_supported":["header"]})).into_response())
+    secure(Json(json!({"resource":&s.resource,"authorization_servers":[s.config.issuer],"scopes_supported":[SCOPE],"bearer_methods_supported":["header"]})).into_response())
 }
 async fn authorize(
     State(s): State<Arc<OAuth>>,

@@ -23,11 +23,16 @@ fn parse(p: &Value) -> Result<(&str, &str, &str)> {
 }
 pub async fn apply(b: &Bridge, p: &Value) -> Result<Value> {
     let (id, emoji, action) = parse(p)?;
-    let (channel, author): (String, String) = b.db.lock().unwrap().query_row(
-        "SELECT channel,author FROM messages WHERE id=?",
-        [id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    use anyhow::Context;
+    let (channel, author): (String, String) =
+        b.db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT channel,author FROM messages WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .context("Source not observed")?;
     if !b.can_respond(&author) {
         bail!("Unauthorized source");
     }
