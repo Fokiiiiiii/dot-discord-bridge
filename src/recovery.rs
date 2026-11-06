@@ -23,6 +23,17 @@ fn safe_reason(s: &str) -> &str {
     }
 }
 
+pub(crate) fn safe_file_error(s: &str) -> &str {
+    match s {
+        "discord_rate_limited"
+        | "discord_payload_too_large"
+        | "discord_upload_rejected"
+        | "discord_transport_uncertain"
+        | "discord_5xx_uncertain" => s,
+        _ => "other",
+    }
+}
+
 pub fn diagnostics(b: &Bridge, args: &Value) -> Result<Value> {
     exact(args, &[])?;
     let db = b.db.lock().unwrap();
@@ -79,6 +90,38 @@ pub fn diagnostics(b: &Bridge, args: &Value) -> Result<Value> {
     let outgoing_truncated = outgoing.len() > LIMIT;
     outgoing.truncate(LIMIT);
     drop(stmt);
+    let mut stmt = db.prepare(
+        "SELECT source,kind,state,result FROM outgoing_jobs ORDER BY length(source) DESC,source DESC LIMIT 20",
+    )?;
+    let recent_outgoing = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .map(|row| {
+            row.map(|(source, kind, state, result)| {
+                let sent_id = result
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .and_then(|v| {
+                        v["message_id"]
+                            .as_str()
+                            .filter(|id| snowflake(id))
+                            .map(str::to_owned)
+                    });
+                json!({
+                    "message_id": source,
+                    "kind": match kind.as_str() { "send" => "send", "edit" => "edit", _ => "other" },
+                    "state": match state.as_str() { "done" => "done", "pending" => "pending", _ => "other" },
+                    "sent_message_id": sent_id
+                })
+            })
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
     let dest_channels = crate::notifications::candidate_channels(&db, owner).unwrap_or_default();
     let dest_count = dest_channels.len();
     let dest_status = match dest_count {
@@ -95,11 +138,47 @@ pub fn diagnostics(b: &Bridge, args: &Value) -> Result<Value> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     let mut stmt = db.prepare(
-        "SELECT source FROM file_sends WHERE state<>'done' ORDER BY length(source),source LIMIT 20",
+        "SELECT source FROM file_sends WHERE state='pending' ORDER BY length(source),source LIMIT 20",
     )?;
     let uncertain_file_sends = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .map(|row| row.map(|source| json!({"message_id": source})))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut stmt = db.prepare(
+        "SELECT source,state,result,size_bytes,updated,error FROM file_sends ORDER BY COALESCE(updated,0) DESC,length(source),source LIMIT 20",
+    )?;
+    let recent_file_sends = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .map(|row| {
+            row.map(|(source, state, result, size_bytes, updated, error)| {
+                let sent_id = result
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .and_then(|v| {
+                        v["message_id"]
+                            .as_str()
+                            .filter(|id| snowflake(id))
+                            .map(str::to_owned)
+                    });
+                json!({
+                    "message_id": source,
+                    "state": match state.as_str() { "done" => "done", "pending" => "pending", "rejected" => "rejected", _ => "other" },
+                    "sent_message_id": sent_id,
+                    "size_bytes": size_bytes,
+                    "error": error.as_deref().map(safe_file_error),
+                    "age_seconds": updated.map(|u| now().saturating_sub(u).max(0))
+                })
+            })
+        })
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     let mut stmt =
@@ -129,10 +208,12 @@ pub fn diagnostics(b: &Bridge, args: &Value) -> Result<Value> {
         "pending_callbacks":queue,"pending_callbacks_truncated":queue_truncated,
         "terminal_callback_failure_history_available":false,
         "uncertain_outgoing":outgoing,"uncertain_outgoing_truncated":outgoing_truncated,
+        "recent_outgoing":recent_outgoing,
         "notification_destination_status":dest_status,
         "notification_destination_count":dest_count,
         "uncertain_notifications":uncertain_notifications,
         "uncertain_file_sends":uncertain_file_sends,
+        "recent_file_sends":recent_file_sends,
         "recent_tool_failures":recent_tool_failures}),
     )
 }
