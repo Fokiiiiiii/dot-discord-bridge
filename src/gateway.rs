@@ -16,6 +16,27 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 // GUILD_MESSAGES (1 << 9) | MESSAGE_CONTENT (1 << 15) are added at Identify time.
 // Owner/responder and channel authorization are enforced in the persistence layer.
 const INTENTS: u64 = 1 << 12;
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+static GATEWAY_PHASE_CODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static LAST_ACK_UNIX: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn set_gateway_phase(code: u8) {
+    GATEWAY_PHASE_CODE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[allow(dead_code)]
+pub fn telemetry() -> (&'static str, Option<i64>) {
+    let phase = match GATEWAY_PHASE_CODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => "connecting",
+        2 => "ready",
+        3 => "reconnecting",
+        4 => "fatal",
+        _ => "starting",
+    };
+    let last_ack = LAST_ACK_UNIX.load(std::sync::atomic::Ordering::Relaxed);
+    (phase, if last_ack > 0 { Some(last_ack) } else { None })
+}
 
 #[derive(Default)]
 struct State {
@@ -120,6 +141,18 @@ enum Outcome {
     Fatal(&'static str),
 }
 
+async fn send_bounded<S>(ws: &mut S, msg: Message) -> Result<()>
+where
+    S: SinkExt<Message> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    time::timeout(SEND_TIMEOUT, ws.send(msg))
+        .await
+        .map_err(|_| anyhow!("Gateway socket write timed out"))?
+        .map_err(|e| anyhow!("Gateway socket write failed: {e}"))?;
+    Ok(())
+}
+
 async fn connection(
     token: &str,
     url: &str,
@@ -128,6 +161,7 @@ async fn connection(
     presence: &PresenceSource,
     limiter: &mut Limiter,
 ) -> Result<Outcome> {
+    set_gateway_phase(1);
     let (mut ws, _) = time::timeout(Duration::from_secs(30), connect_async(url)).await??;
     let hello = time::timeout(Duration::from_secs(20), ws.next())
         .await?
@@ -147,8 +181,11 @@ async fn connection(
     let mut needs_refresh = true;
     let mut presence_tick = time::interval(Duration::from_secs(2));
     presence_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    ws.send(Message::Text(auth_packet(token, state).to_string().into()))
-        .await?;
+    send_bounded(
+        &mut ws,
+        Message::Text(auth_packet(token, state).to_string().into()),
+    )
+    .await?;
     loop {
         tokio::select! {
             _ = presence_tick.tick(), if ready => {
@@ -156,7 +193,7 @@ async fn connection(
                 if limiter.should_send(desired, Instant::now(), needs_refresh) {
                     // Reserve before sending: a transport error can be ambiguous.
                     limiter.sent(desired, Instant::now());
-                    ws.send(Message::Text(presence::packet(desired).to_string().into())).await?;
+                    send_bounded(&mut ws, Message::Text(presence::packet(desired).to_string().into())).await?;
                     needs_refresh = false;
                 }
             }
@@ -166,7 +203,7 @@ async fn connection(
                     return Ok(Outcome::Retry(Duration::from_secs(1)));
                 }
                 acknowledged = false;
-                ws.send(Message::Text(json!({"op":1,"d":state.sequence}).to_string().into())).await?;
+                send_bounded(&mut ws, Message::Text(json!({"op":1,"d":state.sequence}).to_string().into())).await?;
             }
             incoming = ws.next() => {
                 let Some(message) = incoming else {
@@ -177,19 +214,23 @@ async fn connection(
                         if let Some(frame) = frame {
                             let code: u16 = frame.code.into();
                             if fatal_close(code) {
+                                set_gateway_phase(4);
                                 return Ok(Outcome::Fatal("Discord closed Gateway: check bot token, privileged intents, or shard configuration"));
                             }
                             if reset_close(code) { *state = State::default(); }
                         }
                         return Ok(Outcome::Retry(Duration::from_secs(1)));
                     }
-                    Message::Ping(data) => { ws.send(Message::Pong(data)).await?; }
+                    Message::Ping(data) => { send_bounded(&mut ws, Message::Pong(data)).await?; }
                     Message::Text(text) => {
                         let packet: Value = serde_json::from_str(text.as_ref())?;
                         match packet["op"].as_u64() {
-                            Some(11) => acknowledged = true,
+                            Some(11) => {
+                                acknowledged = true;
+                                LAST_ACK_UNIX.store(crate::now(), std::sync::atomic::Ordering::Relaxed);
+                            }
                             Some(1) => {
-                                ws.send(Message::Text(json!({"op":1,"d":state.sequence}).to_string().into())).await?;
+                                send_bounded(&mut ws, Message::Text(json!({"op":1,"d":state.sequence}).to_string().into())).await?;
                             }
                             Some(7) => return Ok(Outcome::Retry(Duration::ZERO)),
                             Some(9) => {
@@ -206,6 +247,7 @@ async fn connection(
                                 persist_and_advance(&packet, state, persist)?;
                                 if matches!(packet["t"].as_str(), Some("READY" | "RESUMED")) {
                                     ready = true;
+                                    set_gateway_phase(2);
                                 }
                             }
                             _ => (),
@@ -334,9 +376,16 @@ pub async fn run(
             backoff = 1;
         }
         match outcome {
-            Ok(Outcome::Fatal(message)) => bail!("{message}"),
-            Ok(Outcome::Retry(delay)) => time::sleep(delay).await,
+            Ok(Outcome::Fatal(message)) => {
+                set_gateway_phase(4);
+                bail!("{message}");
+            }
+            Ok(Outcome::Retry(delay)) => {
+                set_gateway_phase(3);
+                time::sleep(delay).await;
+            }
             Err(_) => {
+                set_gateway_phase(3);
                 // Never print external exception text: it can contain sensitive data.
                 eprintln!("Discord Gateway interrupted; reconnecting");
                 time::sleep(Duration::from_millis(backoff * 1_000 + jitter_ms(1_000))).await;

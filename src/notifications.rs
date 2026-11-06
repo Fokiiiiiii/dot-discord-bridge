@@ -6,7 +6,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub fn init(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS notifications(key_hash TEXT PRIMARY KEY,owner TEXT NOT NULL,content_hash TEXT NOT NULL,channel TEXT NOT NULL,state TEXT NOT NULL,result TEXT,created INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS notification_destinations(owner TEXT NOT NULL,channel TEXT NOT NULL,PRIMARY KEY(owner,channel)); CREATE INDEX IF NOT EXISTS idx_notifications_state_created ON notifications(state, created DESC);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS notifications(key_hash TEXT PRIMARY KEY,owner TEXT NOT NULL,content_hash TEXT NOT NULL,channel TEXT NOT NULL,state TEXT NOT NULL,result TEXT,created INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS notification_destinations(owner TEXT NOT NULL,channel TEXT NOT NULL,PRIMARY KEY(owner,channel)); CREATE TABLE IF NOT EXISTS notification_contents(key_hash TEXT PRIMARY KEY,message_id TEXT NOT NULL,channel TEXT NOT NULL,owner TEXT NOT NULL,content TEXT NOT NULL,created INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_notifications_state_created ON notifications(state, created DESC); CREATE INDEX IF NOT EXISTS idx_notification_contents_msg ON notification_contents(message_id, channel, owner); CREATE INDEX IF NOT EXISTS idx_notification_contents_created ON notification_contents(created);")?;
+    Ok(())
+}
+pub fn prune(db: &Connection, cutoff: i64) -> Result<()> {
+    let _ = db.execute(
+        "DELETE FROM notification_contents WHERE created<?",
+        [cutoff],
+    );
     Ok(())
 }
 /// Call only after validating this channel as the configured owner's one-to-one DM.
@@ -70,9 +77,19 @@ fn prepare(p: &Value, owner: &str) -> Result<Prepared> {
         importance: importance.to_owned(),
     })
 }
+#[derive(Debug)]
+pub(crate) struct NotificationRejected(pub &'static str);
+impl std::fmt::Display for NotificationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for NotificationRejected {}
+
 fn payload(owner: &str, p: &Prepared) -> Value {
     let users = if p.mention { vec![owner] } else { vec![] };
-    json!({"content":p.content,"allowed_mentions":{"parse":[],"users":users,"roles":[],"replied_user":false},"nonce":&p.key_hash[..24],"enforce_nonce":true})
+    let nonce = digest(&format!("notify_owner:{owner}:{}", p.key_hash));
+    json!({"content":p.content,"allowed_mentions":{"parse":[],"users":users,"roles":[],"replied_user":false},"nonce":&nonce[..24],"enforce_nonce":true})
 }
 trait Transport {
     async fn write(&self, channel: &str, body: &Value) -> Result<String>;
@@ -116,6 +133,10 @@ impl Transport for Discord<'_> {
         let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         if status == 429 {
             b.set_rest_cooldown(retry_delay(retry_header, body["retry_after"].as_f64()));
+            return Err(NotificationRejected("Discord rate limited notification").into());
+        }
+        if matches!(status, 400 | 401 | 403 | 404 | 405 | 413 | 422) {
+            return Err(NotificationRejected("Discord rejected notification").into());
         }
         if status != 200 {
             bail!("Notification not confirmed; operator inspection required");
@@ -179,7 +200,7 @@ async fn execute<T: Transport>(b: &Bridge, p: &Value, transport: &T) -> Result<V
         bail!("Invalid configured notification owner");
     }
     let prepared = prepare(p, owner)?;
-    let _lock = b.reply_lock.lock().await;
+    let _lock = b.notify_lock.lock().await;
     let prior: Option<(String, String, String, Option<String>)> =
         b.db.lock()
             .unwrap()
@@ -203,17 +224,34 @@ async fn execute<T: Transport>(b: &Bridge, p: &Value, transport: &T) -> Result<V
     b.check_rest_cooldown()?;
     b.ensure_dm_fresh(&channel).await?;
     record_intent(&mut b.db.lock().unwrap(), owner, &channel, &prepared)?;
-    let id = transport
-        .write(&channel, &payload(owner, &prepared))
-        .await?;
+    let write_res = transport.write(&channel, &payload(owner, &prepared)).await;
+    let id = match write_res {
+        Ok(id) => id,
+        Err(e) => {
+            if e.downcast_ref::<NotificationRejected>().is_some() {
+                let _ = b.db.lock().unwrap().execute(
+                    "DELETE FROM notifications WHERE key_hash=? AND state='pending'",
+                    [&prepared.key_hash],
+                );
+            }
+            return Err(e);
+        }
+    };
     if !snowflake(&id) {
         bail!("Notification response identity invalid");
     }
     let result = json!({"message_id":id,"channel_id":channel,"mention_owner":prepared.mention,"importance":prepared.importance});
-    b.db.lock().unwrap().execute(
-        "UPDATE notifications SET state='done',result=? WHERE key_hash=? AND state='pending'",
-        params![result.to_string(), prepared.key_hash],
-    )?;
+    {
+        let db = b.db.lock().unwrap();
+        db.execute(
+            "UPDATE notifications SET state='done',result=? WHERE key_hash=? AND state='pending'",
+            params![result.to_string(), prepared.key_hash],
+        )?;
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO notification_contents(key_hash,message_id,channel,owner,content,created) VALUES(?,?,?,?,?,?)",
+            params![prepared.key_hash, id, channel, owner, prepared.content, now()],
+        );
+    }
     Ok(result)
 }
 

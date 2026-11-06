@@ -25,9 +25,10 @@ fn sample_inner(bridge: &Bridge) -> Result<Presence> {
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("database lock failed"))?;
+    let cutoff = crate::now() - 7 * 86400;
     let failed: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM inbox WHERE status='failed')",
-        [],
+        "SELECT EXISTS(SELECT 1 FROM inbox WHERE status='failed' AND (received=0 OR received>=?1))",
+        [cutoff],
         |r| r.get(0),
     )?;
     let queued: bool = db.query_row(

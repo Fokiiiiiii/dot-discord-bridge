@@ -8,17 +8,21 @@ use sha2::{Digest, Sha256};
 
 const LIMIT: usize = 20 * 1024 * 1024;
 pub fn init(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS file_sends (key_hash TEXT PRIMARY KEY, source TEXT NOT NULL, content_hash TEXT NOT NULL, state TEXT NOT NULL, result TEXT, size_bytes INTEGER, updated INTEGER, error TEXT); CREATE INDEX IF NOT EXISTS idx_file_sends_state_source ON file_sends(state, source);")?;
-    for col in [
-        "ALTER TABLE file_sends ADD COLUMN size_bytes INTEGER",
-        "ALTER TABLE file_sends ADD COLUMN updated INTEGER",
-        "ALTER TABLE file_sends ADD COLUMN error TEXT",
-    ] {
-        let _ = db.execute(col, []);
-    }
+    db.execute_batch("CREATE TABLE IF NOT EXISTS file_sends (key_hash TEXT PRIMARY KEY, source TEXT NOT NULL, content_hash TEXT NOT NULL, state TEXT NOT NULL, result TEXT, size_bytes INTEGER, updated INTEGER, error TEXT, filename TEXT); CREATE INDEX IF NOT EXISTS idx_file_sends_state_source ON file_sends(state, source);")?;
+    crate::ensure_column(db, "file_sends", "size_bytes", "INTEGER")?;
+    crate::ensure_column(db, "file_sends", "updated", "INTEGER")?;
+    crate::ensure_column(db, "file_sends", "error", "TEXT")?;
+    crate::ensure_column(db, "file_sends", "filename", "TEXT")?;
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_file_sends_updated ON file_sends(updated DESC);",
     )?;
+    Ok(())
+}
+pub fn prune(db: &Connection, cutoff: i64) -> Result<()> {
+    let _ = db.execute(
+        "UPDATE file_sends SET filename=NULL WHERE updated<? AND state='done'",
+        [cutoff],
+    );
     Ok(())
 }
 fn digest(data: &[u8]) -> String {
@@ -29,8 +33,28 @@ fn is_truncated_container(bytes: &[u8]) -> bool {
         return bytes.len() < 20 || !bytes.ends_with(b"\x00\x00\x00\x00IEND\xaeB\x60\x82");
     }
     if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" {
+        let major_brand = if bytes.len() >= 12 {
+            &bytes[8..12]
+        } else {
+            b""
+        };
+        let is_still_image = matches!(
+            major_brand,
+            b"avif"
+                | b"avis"
+                | b"heic"
+                | b"heix"
+                | b"hevc"
+                | b"hevx"
+                | b"mif1"
+                | b"msf1"
+                | b"miaf"
+                | b"jxl "
+        );
         let mut offset = 0usize;
         let mut saw_moov_or_moof = false;
+        let mut saw_meta = false;
+        let mut saw_mdat = false;
         while offset < bytes.len() {
             if bytes.len() - offset < 8 {
                 return true;
@@ -39,6 +63,10 @@ fn is_truncated_container(bytes: &[u8]) -> bool {
             let box_type = &bytes[offset + 4..offset + 8];
             if box_type == b"moov" || box_type == b"moof" {
                 saw_moov_or_moof = true;
+            } else if box_type == b"meta" {
+                saw_meta = true;
+            } else if box_type == b"mdat" {
+                saw_mdat = true;
             }
             let box_len = if size32 == 0 {
                 bytes.len() - offset
@@ -60,6 +88,9 @@ fn is_truncated_container(bytes: &[u8]) -> bool {
                 return true;
             }
             offset += box_len;
+        }
+        if is_still_image {
+            return !((saw_meta && saw_mdat) || saw_moov_or_moof);
         }
         return !saw_moov_or_moof;
     }
@@ -159,20 +190,24 @@ fn prepare(p: &Value) -> Result<(String, String, String, Vec<u8>)> {
     Ok((source.into(), key.into(), name.into(), bytes))
 }
 pub async fn send(b: &Bridge, p: &Value) -> Result<Value> {
-    let (source, key, name, data) = prepare(p)?;
-    let _lock = b.reply_lock.lock().await;
+    let source_raw = string(p, "message_id")?;
+    if !snowflake(source_raw) {
+        bail!("Invalid upload parameters");
+    }
+    let _lock = b.file_send_lock.lock().await;
     let (channel, author): (String, String) =
         b.db.lock()
             .unwrap()
             .query_row(
                 "SELECT channel,author FROM messages WHERE id=?",
-                [&source],
+                [source_raw],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .context("Source not observed")?;
     if !b.can_respond(&author) {
         bail!("Unauthorized source");
     }
+    let (source, key, name, data) = prepare(p)?;
     b.ensure_channel(&channel).await?;
     b.check_rest_cooldown()?;
     let key_hash = digest(key.as_bytes());
@@ -194,24 +229,26 @@ pub async fn send(b: &Bridge, p: &Value) -> Result<Value> {
             .optional()?;
         if let Some((hash, state, result)) = prior {
             if state == "done" && hash == content_hash {
+                crate::typing::finish(&db, &source)?;
                 return Ok(serde_json::from_str(&result.context("Missing result")?)?);
             }
             if state != "rejected" {
                 bail!("Upload conflict or uncertain; inspect Discord");
             }
             db.execute(
-                "UPDATE file_sends SET source=?,content_hash=?,state='pending',result=NULL,size_bytes=?,updated=?,error=NULL WHERE key_hash=?",
-                params![source, content_hash, data.len() as i64, t, key_hash],
+                "UPDATE file_sends SET source=?,content_hash=?,state='pending',result=NULL,size_bytes=?,updated=?,error=NULL,filename=? WHERE key_hash=?",
+                params![source, content_hash, data.len() as i64, t, name, key_hash],
             )?;
         } else {
             db.execute(
-                "INSERT INTO file_sends(key_hash,source,content_hash,state,result,size_bytes,updated,error) VALUES(?,?,?,'pending',NULL,?,?,NULL)",
-                params![key_hash, source, content_hash, data.len() as i64, t],
+                "INSERT INTO file_sends(key_hash,source,content_hash,state,result,size_bytes,updated,error,filename) VALUES(?,?,?,'pending',NULL,?,?,NULL,?)",
+                params![key_hash, source, content_hash, data.len() as i64, t, name],
             )?;
         }
     }
     let boundary = format!("discordbridge{}", uuid::Uuid::new_v4().simple());
-    let payload = json!({"message_reference":{"message_id":source,"channel_id":channel,"fail_if_not_exists":true},"allowed_mentions":{"parse":[],"replied_user":false},"attachments":[{"id":0,"filename":name}],"nonce":&key_hash[..24],"enforce_nonce":true});
+    let nonce = digest(format!("file_send:{source}:{key_hash}").as_bytes());
+    let payload = json!({"message_reference":{"message_id":source,"channel_id":channel,"fail_if_not_exists":true},"allowed_mentions":{"parse":[],"replied_user":false},"attachments":[{"id":0,"filename":name}],"nonce":&nonce[..24],"enforce_nonce":true});
     let payload = payload.to_string();
     let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n{payload}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").into_bytes();
     body.extend_from_slice(&data);
@@ -385,5 +422,34 @@ mod tests {
         });
         let err = prepare(&p_trunc).unwrap_err();
         assert_eq!(err.to_string(), "Upload data appears truncated");
+
+        // Valid AVIF fixture: ftyp=avif, meta box, mdat box (no moov needed)
+        let mut valid_avif = Vec::new();
+        valid_avif.extend_from_slice(&16u32.to_be_bytes());
+        valid_avif.extend_from_slice(b"ftypavif    ");
+        valid_avif.extend_from_slice(&16u32.to_be_bytes());
+        valid_avif.extend_from_slice(b"meta        ");
+        valid_avif.extend_from_slice(&284u32.to_be_bytes());
+        valid_avif.extend_from_slice(b"mdat");
+        valid_avif.extend_from_slice(&vec![0u8; 276]);
+        assert_eq!(valid_avif.len(), 316);
+        let p_avif = json!({
+            "message_id": "333333333333333333",
+            "idempotency_key": "avif-ok",
+            "filename": "image.avif",
+            "data_base64": base64::engine::general_purpose::STANDARD.encode(&valid_avif)
+        });
+        assert_eq!(prepare(&p_avif).unwrap().3.len(), 316);
+    }
+
+    #[test]
+    fn migration_failure_on_locked_table_is_propagated() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE file_sends (key_hash TEXT PRIMARY KEY);")
+            .unwrap();
+        // ensure_column checks existing table_info and adds if missing
+        crate::ensure_column(&db, "file_sends", "filename", "TEXT").unwrap();
+        // calling again is idempotent
+        crate::ensure_column(&db, "file_sends", "filename", "TEXT").unwrap();
     }
 }

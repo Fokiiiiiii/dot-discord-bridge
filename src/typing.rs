@@ -102,14 +102,18 @@ pub async fn tick(b: &Bridge) -> Result<()> {
         let db = b.db.lock().unwrap();
         prune(&db)?;
         let mut q = db.prepare(
-            "SELECT source,channel,sid FROM typing_leases WHERE state='active' LIMIT 20",
+            "SELECT t.source,t.channel,t.sid FROM typing_leases t LEFT JOIN typing_channels tc ON tc.channel=t.channel WHERE t.state='active' ORDER BY COALESCE(tc.next_due,0) ASC, t.created ASC, t.source ASC LIMIT 200",
         )?;
         let rows = q
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
+    let mut refreshed_channels = std::collections::HashSet::new();
     for (source, channel, sid) in rows {
+        if refreshed_channels.contains(&channel) {
+            continue;
+        }
         if !active(b, &source, &sid)? {
             finish(&b.db.lock().unwrap(), &source)?;
             continue;
@@ -140,6 +144,10 @@ pub async fn tick(b: &Bridge) -> Result<()> {
         // One request/channel/eight seconds, independent of source count.
         if !reserve_channel(&b.db.lock().unwrap(), &channel, now())? {
             continue;
+        }
+        refreshed_channels.insert(channel.clone());
+        if refreshed_channels.len() >= 20 {
+            break;
         }
         let response = b
             .http

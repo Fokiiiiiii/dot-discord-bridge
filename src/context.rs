@@ -45,10 +45,35 @@ fn owned_reply(
     owner: &str,
     cutoff: i64,
 ) -> Result<Option<Value>> {
-    let row: Option<(String,i64)> = db.query_row(
+    let row: Option<(String, i64)> = db.query_row(
         "SELECT p.content,p.updated FROM outgoing_parts p JOIN messages m ON m.id=p.source JOIN outgoing_jobs j ON j.source=p.source WHERE p.message_id=?1 AND p.active=1 AND p.content IS NOT NULL AND p.updated>=?4 AND m.received>=?4 AND m.channel=?2 AND m.author=?3 AND j.state='done' LIMIT 1",
-        params![id,channel,owner,cutoff], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-    Ok(row.map(|(text, t)| entry(id, "assistant", None, &text, t)))
+        params![id, channel, owner, cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    if let Some((text, t)) = row {
+        return Ok(Some(entry(id, "assistant", None, &text, t)));
+    }
+
+    let notif_row: Option<(String, i64)> = db.query_row(
+        "SELECT content,created FROM notification_contents WHERE message_id=?1 AND channel=?2 AND owner=?3 AND created>=?4 LIMIT 1",
+        params![id, channel, owner, cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional().unwrap_or(None);
+    if let Some((text, t)) = notif_row {
+        return Ok(Some(entry(id, "assistant", None, &text, t)));
+    }
+
+    let file_row: Option<(String, i64)> = db.query_row(
+        "SELECT filename,created FROM file_sends WHERE message_id=?1 AND (recipient=?2 OR recipient=?3) AND state='confirmed' AND created>=?4 LIMIT 1",
+        params![id, channel, owner, cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional().unwrap_or(None);
+    if let Some((filename, t)) = file_row {
+        let text = format!("[file: {filename}]");
+        return Ok(Some(entry(id, "assistant", None, &text, t)));
+    }
+
+    Ok(None)
 }
 fn cached_owner(
     db: &Connection,
@@ -193,6 +218,43 @@ fn augment_at(
                 rows.push((t, id.clone(), entry(&id, "assistant", None, &text, t)));
             }
         }
+        if let Ok(mut q) = db.prepare(
+            "SELECT message_id,content,created FROM notification_contents WHERE channel=?1 AND owner=?2 AND created>=?3 ORDER BY created DESC,length(message_id) DESC,message_id DESC LIMIT ?4",
+        ) {
+            if let Ok(items) = q.query_map(params![channel, owner, cutoff, (limit + 1) as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            }) {
+                for row in items.flatten() {
+                    let (id, text, t) = row;
+                    if valid_id(&id) {
+                        rows.push((t, id.clone(), entry(&id, "assistant", None, &text, t)));
+                    }
+                }
+            }
+        }
+        if let Ok(mut q) = db.prepare(
+            "SELECT message_id,filename,created FROM file_sends WHERE (recipient=?1 OR recipient=?2) AND state='confirmed' AND message_id IS NOT NULL AND created>=?3 ORDER BY created DESC,length(message_id) DESC,message_id DESC LIMIT ?4",
+        ) {
+            if let Ok(items) = q.query_map(params![channel, owner, cutoff, (limit + 1) as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            }) {
+                for row in items.flatten() {
+                    let (id, filename, t) = row;
+                    if valid_id(&id) {
+                        let text = format!("[file: {filename}]");
+                        rows.push((t, id.clone(), entry(&id, "assistant", None, &text, t)));
+                    }
+                }
+            }
+        }
     }
     rows.sort_by(|a, b| (b.0, b.1.len(), &b.1).cmp(&(a.0, a.1.len(), &a.1)));
     rows.dedup_by(|a, b| a.1 == b.1);
@@ -221,7 +283,7 @@ mod tests {
     const CURRENT: &str = "333333333333333333";
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE messages(id TEXT PRIMARY KEY,channel TEXT,author TEXT,body TEXT,received INTEGER); CREATE TABLE outgoing_parts(source TEXT,part INTEGER,message_id TEXT,content TEXT,updated INTEGER,active INTEGER); CREATE TABLE outgoing_jobs(source TEXT PRIMARY KEY,state TEXT);").unwrap();
+        db.execute_batch("CREATE TABLE messages(id TEXT PRIMARY KEY,channel TEXT,author TEXT,body TEXT,received INTEGER); CREATE TABLE outgoing_parts(source TEXT,part INTEGER,message_id TEXT,content TEXT,updated INTEGER,active INTEGER); CREATE TABLE outgoing_jobs(source TEXT PRIMARY KEY,state TEXT); CREATE TABLE notification_contents(message_id TEXT PRIMARY KEY,channel TEXT,owner TEXT,content TEXT,created INTEGER); CREATE TABLE file_sends(id TEXT PRIMARY KEY,recipient TEXT,message_id TEXT,filename TEXT,filesize INTEGER,state TEXT,created INTEGER);").unwrap();
         db
     }
     fn msg() -> Value {
@@ -437,5 +499,43 @@ mod tests {
         m["message_reference"]["type"] = json!(-1);
         augment_at(&db, &m, &mut data, OWNER, 20, 2000).unwrap();
         assert!(data["reply_to"].is_null());
+    }
+
+    #[test]
+    fn recent_context_and_reply_to_include_notifications_and_file_sends() {
+        let db = db();
+        let now = 2000;
+        db.execute(
+            "INSERT INTO notification_contents VALUES('600000000000000001',?,?,?,?)",
+            params![CHANNEL, OWNER, "Proactive alert", now - 100],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO file_sends VALUES('fs1',?,'600000000000000002','data.csv',1234,'confirmed',?)",
+            params![CHANNEL, now - 50],
+        )
+        .unwrap();
+
+        let mut m = msg();
+        let mut data = json!({});
+        augment_at(&db, &m, &mut data, OWNER, 20, now).unwrap();
+        let ctx = data["recent_context"].as_array().unwrap();
+        assert_eq!(ctx.len(), 2);
+        assert_eq!(ctx[0]["message_id"], "600000000000000001");
+        assert_eq!(ctx[0]["text"], "Proactive alert");
+        assert_eq!(ctx[0]["role"], "assistant");
+        assert_eq!(ctx[1]["message_id"], "600000000000000002");
+        assert_eq!(ctx[1]["text"], "[file: data.csv]");
+        assert_eq!(ctx[1]["role"], "assistant");
+
+        m["message_reference"] = json!({"message_id":"600000000000000001","channel_id":CHANNEL});
+        augment_at(&db, &m, &mut data, OWNER, 20, now).unwrap();
+        assert_eq!(data["reply_to"]["text"], "Proactive alert");
+        assert_eq!(data["reply_to"]["status"], "cached");
+
+        m["message_reference"] = json!({"message_id":"600000000000000002","channel_id":CHANNEL});
+        augment_at(&db, &m, &mut data, OWNER, 20, now).unwrap();
+        assert_eq!(data["reply_to"]["text"], "[file: data.csv]");
+        assert_eq!(data["reply_to"]["status"], "cached");
     }
 }

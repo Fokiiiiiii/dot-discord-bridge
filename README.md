@@ -58,6 +58,8 @@ docker compose exec discord-dm /usr/local/bin/discord-dot-bridge --healthcheck
 ```sh
 cargo test --locked
 cargo build --release --locked
+set -a && . ./deploy/.env && set +a
+DATABASE_PATH="${DATABASE_PATH:-./discord-dm.sqlite3}"
 umask 077
 ./target/release/discord-dot-bridge
 ```

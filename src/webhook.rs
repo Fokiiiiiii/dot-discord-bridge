@@ -158,6 +158,20 @@ impl VerificationPhase {
     }
 }
 
+pub(crate) fn parse_retry_after(header: Option<&str>) -> Option<u64> {
+    let s = header?.trim();
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(secs.clamp(1, 3600));
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+        let diff = dt.timestamp() - crate::now();
+        if diff > 0 {
+            return Some((diff as u64).clamp(1, 3600));
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn post(
     url: &str,
@@ -169,6 +183,22 @@ pub async fn post(
     body: &[u8],
     verification: bool,
 ) -> Result<(u16, Vec<u8>)> {
+    let (status, body, _) =
+        post_with_retry_after(url, hosts, secret, old, sid, eid, body, verification).await?;
+    Ok((status, body))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn post_with_retry_after(
+    url: &str,
+    hosts: &HashSet<String>,
+    secret: &str,
+    old: Option<&str>,
+    sid: &str,
+    eid: &str,
+    body: &[u8],
+    verification: bool,
+) -> Result<(u16, Vec<u8>, Option<u64>)> {
     if body.len() > 262_144 {
         bail!("Webhook body exceeds 256 KiB");
     }
@@ -237,14 +267,20 @@ pub async fn post(
 async fn finish_response(
     mut response: reqwest::Response,
     verification: bool,
-) -> Result<(u16, Vec<u8>)> {
+) -> Result<(u16, Vec<u8>, Option<u64>)> {
     VerificationPhase::HeadersReceived.emit(verification);
     let status = response.status().as_u16();
+    let retry_after = parse_retry_after(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+    );
     // Event acknowledgments depend on status only. Never let an oversized, slow,
     // or broken response body turn permanent 410/413 into a transient retry.
     // Only a successful verification needs its challenge response body.
     if !verification || !(200..300).contains(&status) {
-        return Ok((status, Vec::new()));
+        return Ok((status, Vec::new(), retry_after));
     }
     let mut response_body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| {
@@ -261,7 +297,7 @@ async fn finish_response(
         response_body.extend_from_slice(&chunk);
     }
     VerificationPhase::BodyComplete.emit(verification);
-    Ok((status, response_body))
+    Ok((status, response_body, retry_after))
 }
 
 #[cfg(test)]

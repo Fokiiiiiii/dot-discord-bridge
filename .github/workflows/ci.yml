@@ -31,6 +31,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check version consistency
+        run: |
+          CARGO_VER=$(grep '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2)
+          PLUGIN_VER=$(grep '"version":' plugin-template/plugin.json | head -n1 | cut -d'"' -f4)
+          COMPOSE_VER=$(grep 'image: ghcr.io/' deploy/compose.yaml | head -n1 | cut -d':' -f3)
+          echo "Cargo: $CARGO_VER, Plugin: $PLUGIN_VER, Compose: $COMPOSE_VER"
+          test "$CARGO_VER" = "$PLUGIN_VER"
+          test "$CARGO_VER" = "$COMPOSE_VER"
+
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 

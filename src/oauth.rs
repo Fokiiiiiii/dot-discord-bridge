@@ -466,6 +466,16 @@ async fn resource_metadata(State(s): State<Arc<OAuth>>, h: HeaderMap) -> Respons
     }
     secure(Json(json!({"resource":&s.resource,"authorization_servers":[s.config.issuer],"scopes_supported":[SCOPE],"bearer_methods_supported":["header"]})).into_response())
 }
+fn extract_cookie(h: &HeaderMap) -> Option<String> {
+    h.get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split(';')
+                .find_map(|x| x.trim().strip_prefix("__Host-discord-oauth="))
+        })
+        .map(str::to_owned)
+}
+
 async fn authorize(
     State(s): State<Arc<OAuth>>,
     h: HeaderMap,
@@ -474,14 +484,25 @@ async fn authorize(
     if !s.good_host(&h) || !s.validate_request(&a) {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
     }
+    let existing_cookie = extract_cookie(&h);
     let request = random();
     let cookie = random();
     let result = (|| -> Result<()> {
         let db = s.db.lock().map_err(|_| anyhow::anyhow!("lock"))?;
         db.execute("DELETE FROM oauth_pending WHERE expires<=?1", [now()])?;
+        if let Some(existing_cookie) = existing_cookie {
+            let _ = db.execute(
+                "DELETE FROM oauth_pending WHERE cookie=?1",
+                [hash(&existing_cookie)],
+            );
+        }
         let count: i64 = db.query_row("SELECT COUNT(*) FROM oauth_pending", [], |r| r.get(0))?;
         if count >= 100 {
-            bail!("capacity");
+            let overflow = (count - 99).max(1);
+            db.execute(
+                "DELETE FROM oauth_pending WHERE id IN (SELECT id FROM oauth_pending ORDER BY expires ASC, rowid ASC LIMIT ?1)",
+                [overflow],
+            )?;
         }
         db.execute(
             "INSERT INTO oauth_pending VALUES(?1,?2,?3,?4)",
@@ -1243,5 +1264,35 @@ mod tests {
             .unwrap();
         assert_eq!(expired_tokens, 0);
         assert_eq!(expired_codes, 0);
+    }
+
+    #[tokio::test]
+    async fn oauth_evicts_oldest_pending_to_prevent_dos() {
+        let s = Arc::new(server());
+        // Insert 100 pending authorizations
+        {
+            let db = s.db.lock().unwrap();
+            for i in 0..100 {
+                db.execute(
+                    "INSERT INTO oauth_pending VALUES(?,?,?,?)",
+                    params![
+                        format!("pending_{i:03}"),
+                        format!("cookie_{i:03}"),
+                        "{}",
+                        now() + 300
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let a = auth(&s);
+        let res = authorize(State(s.clone()), headers(), Query(a)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let count: i64 =
+            s.db.lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM oauth_pending", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(count, 100);
     }
 }

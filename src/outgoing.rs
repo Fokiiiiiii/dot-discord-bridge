@@ -44,6 +44,15 @@ enum Action {
         id: String,
     },
 }
+#[derive(Debug)]
+pub struct OutgoingRejected(pub &'static str);
+impl std::fmt::Display for OutgoingRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for OutgoingRejected {}
+
 trait Transport {
     async fn write(
         &self,
@@ -63,7 +72,11 @@ impl Transport for Discord<'_> {
         action: &Action,
     ) -> Result<Option<String>> {
         let b = self.0;
-        b.check_rest_cooldown()?;
+        if b.check_rest_cooldown().is_err() {
+            return Err(anyhow::Error::from(OutgoingRejected(
+                "Discord rate limited outgoing write",
+            )));
+        }
         b.ensure_channel(channel).await?;
         let client = &b.http;
         let base = format!("https://discord.com/api/v10/channels/{channel}/messages");
@@ -123,6 +136,14 @@ async fn confirm_response(
     }
     if status == 429 {
         b.set_rest_cooldown(retry_delay(header_delay, body["retry_after"].as_f64()));
+        return Err(anyhow::Error::from(OutgoingRejected(
+            "Discord rate limited outgoing write",
+        )));
+    }
+    if (400..500).contains(&status) {
+        return Err(anyhow::Error::from(OutgoingRejected(
+            "Discord rejected outgoing write",
+        )));
     }
     if status != 200 || matches!(action, Action::Delete { .. }) {
         bail!("Discord write not confirmed; operator inspection required");
@@ -300,6 +321,8 @@ async fn execute<T: Transport>(b: &Bridge, p: &Value, editing: bool, t: &T) -> R
     // Journal is already pending before every external write. On any failure it
     // remains quarantined across restart; confirmed earlier parts remain visible.
     let operation_nonce = uuid::Uuid::new_v4().to_string();
+    let mut confirmed_in_run = 0;
+    #[allow(clippy::explicit_counter_loop)]
     for action in actions {
         let (index, kind, target, hash) = match &action {
             Action::Create { index, text } => (*index, "create", None, Some(digest(text))),
@@ -313,7 +336,34 @@ async fn execute<T: Transport>(b: &Bridge, p: &Value, editing: bool, t: &T) -> R
             "INSERT INTO outgoing_writes VALUES(?,?,?,?,?,?,'pending',?)",
             params![write_id, source, index, kind, target, hash, now()],
         )?;
-        let id = t.write(&channel, source, &operation_nonce, &action).await?;
+        let id_res = t.write(&channel, source, &operation_nonce, &action).await;
+        let id = match id_res {
+            Ok(id) => id,
+            Err(e) => {
+                let is_rejected = e.downcast_ref::<OutgoingRejected>().is_some();
+                if confirmed_in_run == 0 && is_rejected {
+                    let mut db = b.db.lock().unwrap();
+                    let tx = db.transaction()?;
+                    tx.execute("DELETE FROM outgoing_writes WHERE id=?", [&write_id])?;
+                    tx.execute(
+                        "DELETE FROM outgoing_jobs WHERE source=? AND state='pending'",
+                        [source],
+                    )?;
+                    if !editing {
+                        tx.execute(
+                            "DELETE FROM replies WHERE source=? AND result IS NULL",
+                            [source],
+                        )?;
+                    }
+                    tx.commit()?;
+                } else if confirmed_in_run > 0 {
+                    bail!(
+                        "Multipart write partially committed; confirmed parts remain visible: {e}"
+                    );
+                }
+                return Err(e);
+            }
+        };
         let mut db = b.db.lock().unwrap();
         let db = db.transaction()?;
         match action {
@@ -352,6 +402,7 @@ async fn execute<T: Transport>(b: &Bridge, p: &Value, editing: bool, t: &T) -> R
             [write_id],
         )?;
         db.commit()?;
+        confirmed_in_run += 1;
     }
     let mut db = b.db.lock().unwrap();
     let tx = db.transaction()?;
@@ -791,5 +842,94 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    struct RejectMock {
+        fail_at: Option<usize>,
+        reject_at: Option<usize>,
+    }
+    impl Transport for RejectMock {
+        async fn write(
+            &self,
+            _channel: &str,
+            _source: &str,
+            _revision: &str,
+            action: &Action,
+        ) -> Result<Option<String>> {
+            let n = match action {
+                Action::Create { index, .. } => *index,
+                Action::Edit { index, .. } => *index,
+                Action::Delete { index, .. } => *index,
+            };
+            if self.reject_at == Some(n) {
+                return Err(anyhow::Error::from(OutgoingRejected("Synthetic rejection")));
+            }
+            if self.fail_at == Some(n) {
+                bail!("Synthetic uncertain failure");
+            }
+            Ok(match action {
+                Action::Create { .. } => Some(format!("7{n:017}")),
+                Action::Edit { id, .. } => Some(id.clone()),
+                Action::Delete { .. } => None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rejection_on_first_part_cleans_up_pending_allowing_retry() {
+        let b = bridge();
+        let t = RejectMock {
+            fail_at: None,
+            reject_at: Some(0),
+        };
+        let res = execute(&b, &request("hello world"), false, &t).await;
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .downcast_ref::<OutgoingRejected>()
+            .is_some());
+
+        {
+            let db = b.db.lock().unwrap();
+            let pending_jobs: i64 = db
+                .query_row("SELECT count(*) FROM outgoing_jobs", [], |r| r.get(0))
+                .unwrap();
+            let pending_replies: i64 = db
+                .query_row("SELECT count(*) FROM replies", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(pending_jobs, 0);
+            assert_eq!(pending_replies, 0);
+        }
+
+        let t_success = Mock::new(None);
+        let res2 = execute(&b, &request("hello world"), false, &t_success).await;
+        assert!(res2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn partial_failure_marks_job_as_partial_and_reports_partially_committed() {
+        let b = bridge();
+        let long_text = "a".repeat(2000)
+            + "
+
+" + &"b".repeat(2000);
+        let t = RejectMock {
+            fail_at: None,
+            reject_at: Some(1),
+        };
+        let res = execute(&b, &request(&long_text), false, &t).await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("partially committed"));
+
+        let db = b.db.lock().unwrap();
+        let state: String = db
+            .query_row(
+                "SELECT state FROM outgoing_jobs WHERE source=?",
+                [SOURCE],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "pending");
     }
 }

@@ -217,16 +217,39 @@ struct Config {
     oauth: Option<Arc<oauth::OAuth>>,
     bot: String,
 }
+pub(crate) fn ensure_column(db: &Connection, table: &str, col: &str, ty: &str) -> Result<()> {
+    let mut stmt = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    let mut exists = false;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(1)?;
+        if name == col {
+            exists = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    if !exists {
+        db.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), [])?;
+    }
+    Ok(())
+}
+
 struct Bridge {
     db: Mutex<Connection>,
     http: reqwest::Client,
     config: Config,
     reply_lock: AsyncMutex<()>,
+    file_send_lock: AsyncMutex<()>,
+    notify_lock: AsyncMutex<()>,
     subscribe_lock: AsyncMutex<()>,
     verified: Mutex<HashMap<String, i64>>,
     dm_verified: Mutex<HashMap<String, i64>>,
     guild_verified: Mutex<HashMap<String, i64>>,
     rest_not_before: Mutex<i64>,
+    mcp_body_permits: Arc<tokio::sync::Semaphore>,
+    worker_last_progress: Arc<std::sync::atomic::AtomicI64>,
 }
 #[derive(Clone)]
 struct Subscription {
@@ -245,13 +268,36 @@ impl Bridge {
         }
         match &self.config.responders_file {
             None => self.config.users.contains(user),
-            Some(path) => std::fs::read(path)
+            Some(path) => std::fs::File::open(path)
                 .ok()
-                .filter(|b| b.len() <= 65536)
-                .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+                .and_then(|file| {
+                    let metadata = file.metadata().ok()?;
+                    if metadata.len() > 65536 {
+                        return None;
+                    }
+                    let mut buf = Vec::new();
+                    use std::io::Read;
+                    let mut take = std::io::Read::take(file, 65537);
+                    take.read_to_end(&mut buf).ok()?;
+                    if buf.len() > 65536 {
+                        return None;
+                    }
+                    serde_json::from_slice::<Vec<String>>(&buf).ok()
+                })
                 .filter(|ids| !ids.is_empty() && ids.iter().all(|id| snowflake(id)))
                 .is_some_and(|ids| ids.iter().any(|id| id == user)),
         }
+    }
+    fn verified_channel_is_guild(&self, ch: &str) -> bool {
+        self.config.guild_enabled
+            && self
+                .guild_verified
+                .lock()
+                .unwrap()
+                .get(ch)
+                .copied()
+                .unwrap_or(0)
+                > now()
     }
     fn new(path: &str, config: Config) -> Result<Self> {
         if config.users.len() != 1 {
@@ -289,7 +335,8 @@ impl Bridge {
         CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,channel TEXT NOT NULL,author TEXT NOT NULL,body TEXT NOT NULL,received INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS queue(sid TEXT NOT NULL,eid TEXT NOT NULL,body TEXT NOT NULL,tries INTEGER NOT NULL DEFAULT 0,due INTEGER NOT NULL,PRIMARY KEY(sid,eid));
         CREATE TABLE IF NOT EXISTS replies(source TEXT PRIMARY KEY,content_hash TEXT NOT NULL,result TEXT);
-        CREATE TABLE IF NOT EXISTS inbox(id TEXT PRIMARY KEY,channel TEXT NOT NULL,author TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',tries INTEGER NOT NULL DEFAULT 0,due INTEGER NOT NULL,received INTEGER NOT NULL,last_error TEXT);")?;
+        CREATE TABLE IF NOT EXISTS inbox(id TEXT PRIMARY KEY,channel TEXT NOT NULL,author TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',tries INTEGER NOT NULL DEFAULT 0,due INTEGER NOT NULL,received INTEGER NOT NULL,last_error TEXT);
+        CREATE TABLE IF NOT EXISTS callback_failures(id INTEGER PRIMARY KEY AUTOINCREMENT,sid TEXT NOT NULL,eid TEXT NOT NULL,status INTEGER,error TEXT,at INTEGER NOT NULL);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS bridge_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT OR IGNORE INTO bridge_metadata VALUES('mode','owner-dm-v1');")?;
         let owner = config.users.iter().next().unwrap();
         let previous_owner: Option<String> = db
@@ -350,11 +397,15 @@ impl Bridge {
             http,
             config,
             reply_lock: AsyncMutex::new(()),
+            file_send_lock: AsyncMutex::new(()),
+            notify_lock: AsyncMutex::new(()),
             subscribe_lock: AsyncMutex::new(()),
             verified: Mutex::new(HashMap::new()),
             dm_verified: Mutex::new(dm_verified),
             guild_verified: Mutex::new(HashMap::new()),
             rest_not_before: Mutex::new(0),
+            mcp_body_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+            worker_last_progress: Arc::new(std::sync::atomic::AtomicI64::new(now())),
         })
     }
     fn is_verified_dm(&self, ch: &str) -> bool {
@@ -594,10 +645,12 @@ impl Bridge {
         Ok(())
     }
     fn finish_inbox_message(&self, id: &str, ch: &str, author: &str, m: &Value) -> Result<()> {
+        let is_guild = !m["guild_id"].is_null() || self.verified_channel_is_guild(ch);
         if m["id"].as_str() != Some(id)
             || m["channel_id"].as_str() != Some(ch)
             || m["author"]["id"].as_str() != Some(author)
-            || (!self.config.guild_enabled && !m["guild_id"].is_null())
+            || (is_guild && !self.config.guild_enabled)
+            || (!is_guild && !self.config.guild_enabled && !m["guild_id"].is_null())
             || m["author"]["bot"].as_bool() == Some(true)
             || !m["webhook_id"].is_null()
             || !m["content"].is_string()
@@ -838,17 +891,9 @@ impl Bridge {
         let ch = m["channel_id"].as_str().unwrap_or("");
         let author = m["author"]["id"].as_str().unwrap_or("");
         let mid = m["id"].as_str().unwrap_or("");
-        let is_guild = !m["guild_id"].is_null();
+        let is_guild = !m["guild_id"].is_null() || self.verified_channel_is_guild(ch);
         let channel_verified = if is_guild {
-            self.config.guild_enabled
-                && self
-                    .guild_verified
-                    .lock()
-                    .unwrap()
-                    .get(ch)
-                    .copied()
-                    .unwrap_or(0)
-                    > now()
+            self.config.guild_enabled && self.verified_channel_is_guild(ch)
         } else {
             self.is_verified_dm(ch)
         };
@@ -1005,6 +1050,7 @@ impl Bridge {
                 (true, false)
             };
             let mut delivery_attempt = None;
+            let mut retry_after_sec = None;
             let status = if !grant_allowed {
                 410
             } else if !dm_ok {
@@ -1016,7 +1062,7 @@ impl Bridge {
                     None
                 };
                 let attempt_at = now();
-                let http_status = webhook::post(
+                match webhook::post_with_retry_after(
                     &s.url,
                     &self.config.callbacks,
                     &s.secret,
@@ -1027,10 +1073,17 @@ impl Bridge {
                     false,
                 )
                 .await
-                .ok()
-                .map(|response| response.0);
-                delivery_attempt = Some((attempt_at, tries, http_status));
-                http_status.unwrap_or(0)
+                {
+                    Ok(resp) => {
+                        delivery_attempt = Some((attempt_at, tries, Some(resp.0)));
+                        retry_after_sec = resp.2;
+                        resp.0
+                    }
+                    Err(_) => {
+                        delivery_attempt = Some((attempt_at, tries, None));
+                        0
+                    }
+                }
             } else {
                 410
             };
@@ -1072,13 +1125,27 @@ impl Bridge {
                     {
                         typing::finish(&db, source)?;
                     }
+                    let err_reason = if status == 0 {
+                        "transport_failure"
+                    } else {
+                        "http_rejection"
+                    };
+                    let _ = db.execute(
+                        "INSERT INTO callback_failures(sid,eid,status,error,at) VALUES(?,?,?,?,?)",
+                        params![sid, eid, (status != 0).then_some(status), err_reason, now()],
+                    );
                     eprintln!("event delivery ended without acknowledgment (status {status})");
                 }
             } else {
-                let delay = (1_i64 << (tries + 1).min(8)).min(300);
+                let delay = if status == 429 {
+                    retry_after_sec.unwrap_or(60).clamp(1, 3600) as i64
+                } else {
+                    (1_i64 << (tries + 1).min(8)).min(300)
+                };
+                let inc = if status == 429 { 0 } else { 1 };
                 db.execute(
-                    "UPDATE queue SET tries=tries+1,due=? WHERE sid=? AND eid=?",
-                    params![now() + delay, sid, eid],
+                    "UPDATE queue SET tries=tries+?,due=? WHERE sid=? AND eid=?",
+                    params![inc, now() + delay, sid, eid],
                 )?;
             }
         }
@@ -1171,7 +1238,7 @@ impl Bridge {
         if !self.is_verified_channel(ch) {
             bail!("Reply recipient not verified");
         }
-        let is_guild = !m["guild_id"].is_null();
+        let is_guild = !m["guild_id"].is_null() || self.verified_channel_is_guild(ch);
         if m["id"].as_str() != Some(mid)
             || m["channel_id"].as_str() != Some(ch)
             || m["author"]["id"].as_str() != Some(author)
@@ -1234,6 +1301,10 @@ impl Bridge {
             "text_truncated": text_truncated,
             "is_guild": is_guild
         });
+        let exists_before: i64 =
+            tx.query_row("SELECT count(*) FROM messages WHERE id=?", [mid], |r| {
+                r.get(0)
+            })?;
         tx.execute(
             "INSERT INTO messages(id,channel,author,body,received) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
             params![mid, ch, author, stored.to_string(), received],
@@ -1242,6 +1313,20 @@ impl Bridge {
             "UPDATE inbox SET status='done',last_error=NULL WHERE id=? AND status<>'done'",
             [mid],
         )?;
+        if exists_before == 0 {
+            let eid = format!("discord_{mid}");
+            let body = serde_json::to_string(&json!({
+                "eventId": eid,
+                "name": EVENT,
+                "timestamp": timestamp,
+                "data": data,
+                "cursor": null
+            }))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO queue(sid,eid,body,due) SELECT id,?,?,? FROM subscriptions WHERE owner=? AND expires>?",
+                params![eid, body, now(), self.config.users.iter().next().unwrap(), now()],
+            )?;
+        }
         let reply_history: Option<Value> = tx
             .query_row(
                 "SELECT kind,state,result FROM outgoing_jobs WHERE source=?",
@@ -1565,7 +1650,26 @@ fn classify_tool_error(tool: &str, err: &anyhow::Error) -> (&'static str, &'stat
         };
         return ("pre_send_rejected", reason);
     }
+    if let Some(nr) = err.downcast_ref::<notifications::NotificationRejected>() {
+        let reason = if nr.0.contains("rate limited") {
+            "rate_limited"
+        } else {
+            "discord_write_rejected"
+        };
+        return ("pre_send_rejected", reason);
+    }
+    if let Some(orr) = err.downcast_ref::<outgoing::OutgoingRejected>() {
+        let reason = if orr.0.contains("rate limited") {
+            "rate_limited"
+        } else {
+            "discord_write_rejected"
+        };
+        return ("pre_send_rejected", reason);
+    }
     let msg = err.to_string();
+    if msg.starts_with("Multipart write partially committed") {
+        return ("delivery_uncertain", "multipart_partial_failure");
+    }
     if msg.starts_with("Missing string")
         || msg.starts_with("Extra field")
         || msg == "Unexpected fields"
@@ -1746,6 +1850,70 @@ fn format_event_delivery_attempt(
     )
 }
 
+async fn handle_mcp(
+    State(b): State<Arc<Bridge>>,
+    method: Method,
+    headers: HeaderMap,
+    req: axum::extract::Request,
+) -> Response {
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    if !b.config.hosts.contains(host) || headers.contains_key("origin") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let family = b.config.oauth.as_ref().and_then(|oauth| {
+        auth.strip_prefix("Bearer ")
+            .and_then(|token| oauth.grant_for_bearer(token))
+    });
+    let authorized = if b.config.oauth.is_some() {
+        family.is_some()
+    } else if !b.config.bearer.is_empty() {
+        auth.strip_prefix("Bearer ").is_some_and(|token| {
+            let actual = Sha256::digest(token.as_bytes());
+            let expected = Sha256::digest(b.config.bearer.as_bytes());
+            bool::from(actual.as_slice().ct_eq(expected.as_slice()))
+        })
+    } else {
+        false
+    };
+    if !authorized {
+        return if let Some(oauth) = &b.config.oauth {
+            (
+                StatusCode::UNAUTHORIZED,
+                [("www-authenticate", oauth.challenge())],
+            )
+                .into_response()
+        } else {
+            StatusCode::UNAUTHORIZED.into_response()
+        };
+    }
+    if method != Method::POST {
+        return (StatusCode::METHOD_NOT_ALLOWED, [("allow", "POST")]).into_response();
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if content_length.is_some_and(|len| len > MAX_MCP_BODY) {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let _permit = match b.mcp_body_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let body = match axum::body::to_bytes(req.into_body(), MAX_MCP_BODY).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    handle(State(b), method, headers, body).await
+}
+
 async fn handle(
     State(b): State<Arc<Bridge>>,
     method: Method,
@@ -1864,6 +2032,10 @@ async fn health(State(b): State<Arc<Bridge>>) -> StatusCode {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().any(|a| a == "--version" || a == "-V") {
+        println!("dot-discord-bridge {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if env::args().any(|a| a == "--healthcheck") {
         let port: u16 = env::var("PORT").unwrap_or_else(|_| "8787".into()).parse()?;
         let status = reqwest::Client::builder()
@@ -1923,7 +2095,7 @@ async fn main() -> Result<()> {
     // The deployment must set umask 077 before startup; avoid leaking sqlite sidecars.
     let b = Arc::new(Bridge::new(&path, config)?);
     let mut app = Router::new()
-        .route("/mcp", any(handle))
+        .route("/mcp", any(handle_mcp))
         .route("/healthz", axum::routing::get(health))
         .layer(DefaultBodyLimit::max(MAX_MCP_BODY))
         .with_state(b.clone());
@@ -1952,10 +2124,15 @@ async fn main() -> Result<()> {
                     json!({"event":"worker_error","worker":"delivery","reason":classify_tool_error("worker_delivery",&err).1})
                 );
             }
+            worker
+                .worker_last_progress
+                .store(now(), std::sync::atomic::Ordering::Relaxed);
             if ticks.is_multiple_of(60) {
                 let db = worker.db.lock().unwrap();
                 let cutoff = now() - 7 * 86400;
                 let _ = outgoing::prune(&db, cutoff);
+                let _ = file_send::prune(&db, cutoff);
+                let _ = notifications::prune(&db, cutoff);
                 let _ = typing::prune(&db);
                 let _ = db.execute("DELETE FROM messages WHERE received<?", [cutoff]);
                 let _ = db.execute(
@@ -1967,6 +2144,7 @@ async fn main() -> Result<()> {
                     "DELETE FROM subscription_grants WHERE NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.id=subscription_grants.sid)",
                     [],
                 );
+                let _ = db.execute("DELETE FROM callback_failures WHERE at<?", [cutoff]);
             }
             ticks = ticks.wrapping_add(1);
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1988,13 +2166,36 @@ async fn main() -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
+    let shutdown_signal = async {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+    };
     tokio::select! {
         r=typing_worker=>{r?;},
-        r=axum::serve(listener,app)=>{r?;},
+        r=axum::serve(listener,app).with_graceful_shutdown(shutdown_signal)=>{r?;},
         r=gateway::run(b.config.bot.clone(),persist,presence)=>{r?;},
         r=delivery=>{r?;},
-        _=tokio::signal::ctrl_c()=>{}
     }
+    // Graceful drain: wait for in-flight active operations to release locks
+    let _reply = b.reply_lock.lock().await;
+    let _file = b.file_send_lock.lock().await;
+    let _notify = b.notify_lock.lock().await;
     Ok(())
 }
 
@@ -4202,5 +4403,149 @@ mod dm_tests {
         println!(
             "BENCHMARK_RESULTS: split_short_us={split_short_us:.2} split_long_us={split_long_us:.2} ingest_with_context_us={ingest_us:.2} oauth_verify_us={oauth_verify_us:.2} prune_pair_us={prune_us:.2} status_plus_diag_rpc_us={rpc_diag_us:.2}"
         );
+    }
+
+    #[tokio::test]
+    async fn h01_rest_message_missing_guild_id_correctly_classified_as_guild_and_does_not_corrupt_destinations(
+    ) {
+        let b = Bridge::new(
+            ":memory:",
+            Config {
+                verified_dm_fixture: HashSet::new(),
+                users: HashSet::from(["222222222222222222".into()]),
+                responders_file: None,
+                guild_enabled: true,
+                callbacks: HashSet::from(["callback.example".into()]),
+                hosts: HashSet::from(["localhost".into()]),
+                recent_context_limit: 10,
+                typing_timeout_secs: 120,
+                bearer: "a".repeat(32),
+                oauth: None,
+                bot: "unused".into(),
+            },
+        )
+        .unwrap();
+        let guild_ch = "555555555555555555";
+        b.guild_verified
+            .lock()
+            .unwrap()
+            .insert(guild_ch.into(), now() + 300);
+
+        let m = json!({
+            "id": "777777777777777777",
+            "channel_id": guild_ch,
+            "author": {"id": "222222222222222222"},
+            "content": "Guild announcement",
+            "guild_id": null
+        });
+
+        let ok = b.ingest(&m).unwrap();
+        assert!(
+            ok,
+            "Ingest should succeed for verified guild channel even if guild_id is null"
+        );
+
+        let db = b.db.lock().unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM notification_destinations WHERE channel=?",
+                [guild_ch],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "Guild channel must not be registered as owner DM notification destination"
+        );
+
+        let body_str: String = db
+            .query_row(
+                "SELECT body FROM messages WHERE id='777777777777777777'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(body["is_guild"], true);
+    }
+
+    #[tokio::test]
+    async fn m01_read_message_prior_to_worker_enqueues_event_atomically() {
+        let b = Bridge::new(":memory:", cfg()).unwrap();
+        b.accept_dm_descriptor("111111111111111111", &descriptor())
+            .unwrap();
+        let mid = "444444444444444444";
+        let ch = "111111111111111111";
+        let author = "222222222222222222";
+        b.stage_raw(&json!({
+            "id": mid,
+            "channel_id": ch,
+            "author": {"id": author}
+        }))
+        .unwrap();
+
+        let db = b.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO subscriptions VALUES('sub1',?,'https://callback.example/webhook','secret',?,'',0)",
+            params![author, now() + 3600],
+        ).unwrap();
+        drop(db);
+
+        let m = json!({
+            "id": mid,
+            "channel_id": ch,
+            "author": {"id": author},
+            "content": "Read first message",
+            "guild_id": null
+        });
+        let res = b.apply_read_message(mid, ch, author, now(), &m);
+        assert!(res.is_ok());
+
+        let db = b.db.lock().unwrap();
+        let q_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM queue WHERE eid=?",
+                [format!("discord_{mid}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            q_count, 1,
+            "Queue must contain the event after first read_message"
+        );
+        let inbox_status: String = db
+            .query_row("SELECT status FROM inbox WHERE id=?", [mid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(inbox_status, "done");
+        drop(db);
+
+        let res2 = b.apply_read_message(mid, ch, author, now(), &m);
+        assert!(res2.is_ok());
+        let db = b.db.lock().unwrap();
+        let q_count2: i64 = db
+            .query_row(
+                "SELECT count(*) FROM queue WHERE eid=?",
+                [format!("discord_{mid}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(q_count2, 1, "Queue count must remain 1 on refresh");
+    }
+
+    #[tokio::test]
+    async fn m07_locks_are_independent() {
+        let b = Bridge::new(":memory:", cfg()).unwrap();
+        let guard1 = b.reply_lock.lock().await;
+        let guard2 = b.file_send_lock.try_lock();
+        assert!(
+            guard2.is_ok(),
+            "file_send_lock must be independent of reply_lock"
+        );
+        let guard3 = b.notify_lock.try_lock();
+        assert!(
+            guard3.is_ok(),
+            "notify_lock must be independent of reply_lock"
+        );
+        drop(guard1);
     }
 }

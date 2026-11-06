@@ -63,6 +63,10 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Smoke test native binary
+        if: "!matrix.use_cross"
+        run: ./target/${{ matrix.target }}/release/${BINARY_NAME} --version
+
       - name: Package distribution archive
         run: |
           if [[ "${GITHUB_REF_NAME:-}" == v* ]]; then
@@ -74,7 +78,17 @@ jobs:
           mkdir -p "${STAGE}"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${STAGE}/"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}-linux-${{ matrix.arch }}"
-          cp README.md .env.example Dockerfile "${STAGE}/"
+          cp README.md LICENSE .env.example Dockerfile "${STAGE}/"
+          cat << 'EOF' > "${STAGE}/Dockerfile.binary"
+          FROM debian:bookworm-slim
+          RUN groupadd --gid 10001 bridge && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin bridge && mkdir /data && chown 10001:10001 /data && chmod 700 /data
+          COPY discord-dot-bridge /usr/local/bin/discord-dot-bridge
+          USER 10001:10001
+          WORKDIR /data
+          ENV DATABASE_PATH=/data/discord-dm.sqlite3 PORT=8787
+          HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["/usr/local/bin/discord-dot-bridge", "--healthcheck"]
+          ENTRYPOINT ["/bin/sh", "-c", "umask 077; exec /usr/local/bin/discord-dot-bridge"]
+          EOF
           cp -r deploy plugin-template "${STAGE}/"
           tar -czf "${STAGE}.tar.gz" "${STAGE}"
           sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"

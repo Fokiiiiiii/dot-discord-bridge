@@ -1,6 +1,6 @@
 services:
   discord-dm:
-    image: ghcr.io/fokiiiiiii/dot-discord-bridge:0.5.3
+    image: ghcr.io/fokiiiiiii/dot-discord-bridge:0.5.5
     build:
       context: ..
       dockerfile: Dockerfile
@@ -22,7 +22,7 @@ services:
       - no-new-privileges:true
     pids_limit: 128
     restart: unless-stopped
-    stop_grace_period: 20s
+    stop_grace_period: 35s
     logging:
       driver: json-file
       options:
